@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aynı haber, farklı ülkeler</title>
+<meta name="description" content="Bir konuyu farklı ülkelerin haberlerinde karşılaştır: neyin ortak, neyin tartışmalı olduğunu, olayın zaman çizelgesini ve iç yüzünü gör.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Aynı haber, farklı ülkeler">
+<meta property="og:description" content="Bir olayın farklı ülkelerde nasıl anlatıldığını keşfet.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🌍%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=Newsreader:wght@500;700&family=Source+Sans+3:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+<style>
+:root{
+  --paper:#FAFAF8; --card:#FFFFFF; --ink:#16130F; --muted:#6B6762; --line:#DEDBD4; --r:2px;
+  --sea:#C8102E; --amber:#B7791F; --good:#1F7A4D; --bad:#B3261E; --land:#D6D3CC; --ocean:#EEF0F2;
+  --head:"Newsreader",Georgia,serif;--head0:"Bricolage Grotesque","Segoe UI",system-ui,sans-serif;
+  --body:"Source Sans 3","Segoe UI",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:400 1.0625rem/1.55 var(--body)}
+main{max-width:46rem;margin:0 auto;padding:4rem 1.25rem 5rem}
+h1{font:700 clamp(2.4rem,7vw,3.6rem)/1.02 var(--head);letter-spacing:-.02em;margin:0 0 1rem}
+.lead{color:var(--muted);max-width:34rem;margin:0 0 2rem}
+form{display:flex;gap:.5rem;flex-wrap:wrap}
+input{flex:1 1 16rem;font:inherit;padding:.8rem 1rem;border:1.5px solid var(--ink);background:var(--card);color:var(--ink);border-radius:3px}
+button{font:600 1rem var(--body);padding:.8rem 1.4rem;background:var(--ink);color:#fff;border:0;border-radius:3px;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+:focus-visible{outline:3px solid var(--sea);outline-offset:2px}
+#status{margin:1.5rem 0 0;color:var(--muted)}
+#status.err{color:var(--bad)}
+h2{font:700 1.15rem var(--head);margin:0 0 .5rem}
+section{border-left:3px solid var(--line);padding:.1rem 0 .1rem 1.1rem;margin:2rem 0}
+section.conf{border-color:var(--sea)}
+section.conflict{border-color:var(--amber)}
+#result{margin-top:2.5rem}
+.summary{font:500 1.3rem/1.4 var(--head);margin:0 0 1.5rem}
+ul{margin:0;padding-left:1.1rem}li{margin:.35rem 0}
+.level{display:inline-block;font-weight:600;padding:.1rem .6rem;border-radius:2px;color:#fff}
+.Yüksek{background:var(--good)}.Orta{background:var(--amber)}.Düşük{background:var(--bad)}
+.claim{font-weight:600;margin:1rem 0 .3rem}
+.sides{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:.75rem}
+.side{background:var(--card);padding:.6rem .8rem;border-radius:3px}
+.side b{display:block;font-size:.9rem;color:var(--muted)}
+details{border-top:1px solid var(--line);padding:.6rem 0}
+summary{cursor:pointer;font-weight:600}
+details ul{list-style:none;padding:0;margin:.5rem 0 0}
+details li{font-size:.95rem;color:var(--muted)}
+details a{color:var(--ink)}
+.note{font-size:.9rem;color:var(--muted);margin-top:2.5rem}
+.ghost{background:transparent;color:var(--ink);border:1.5px solid var(--line);padding:.35rem .8rem;font-size:.9rem}
+#hist{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.8rem}
+#hist button{background:transparent;color:var(--muted);border:1px solid var(--line);padding:.2rem .7rem;font-size:.9rem;font-weight:400;border-radius:99px}
+sup a,.ref{color:var(--sea);font-weight:600;text-decoration:none;cursor:pointer;margin:0 .1rem}
+.tick{color:var(--good);font-size:.85rem;white-space:nowrap}
+.stat{font-size:.9rem;color:var(--muted);margin:-.8rem 0 1.5rem}
+.bars em{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist{display:flex;gap:4px;align-items:flex-end;margin:.4rem 0 1rem}
+.hist div{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
+.hist span{display:block;width:100%;background:var(--sea);border-radius:2px 2px 0 0;min-height:2px}
+.hist em{font-size:.7rem;font-style:normal;color:var(--muted);margin-top:2px}
+.nums{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.6rem}
+.num{background:var(--card);border-radius:3px;padding:.7rem .8rem}
+.num b{display:block;font:700 1.7rem/1.1 var(--head);color:var(--sea);overflow-wrap:anywhere}
+.num p{margin:.3rem 0 0;font-size:.85rem;color:var(--muted)}
+.heat{display:grid;gap:3px;align-items:center;font-size:.85rem}
+.hl{padding-right:.5rem}.hc{text-align:center;font-size:.7rem;color:var(--muted)}
+.hx{height:1.7rem;border-radius:2px;background:var(--line);display:flex;align-items:center;justify-content:center;font-weight:600}
+.hit{background:var(--card)3c4;color:#10243A}
+
+.gauge{display:flex;gap:4px;margin:.5rem 0}.gauge i{flex:1;height:8px;background:var(--line);border-radius:2px}.gauge i.on{background:var(--c)}
+.tl{list-style:none;margin:0;padding:0 0 0 1rem;border-left:2px solid var(--line)}
+.tl li{position:relative;margin:0 0 1rem;padding-left:.8rem}
+.tl li::before{content:"";position:absolute;left:-1.42rem;top:.5rem;width:10px;height:10px;border-radius:50%;background:var(--sea)}
+.tl b{display:block;color:var(--sea)}
+.bars div{display:grid;grid-template-columns:11rem 1fr 2rem;gap:.5rem;align-items:center;font-size:.9rem;margin:.25rem 0}
+.bars em{font-style:normal}.bars span{display:block;height:10px;background:var(--sea);border-radius:2px}
+.map{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:3px;margin-bottom:.8rem}
+.map line{stroke:var(--line);stroke-width:1}.map circle{fill:var(--sea);fill-opacity:.55;stroke:var(--sea)}.map text{font-size:10px;fill:var(--ink)}
+.gal{display:flex;gap:.75rem;overflow-x:auto;padding-bottom:.5rem}
+.gal a{flex:0 0 11rem;color:inherit;text-decoration:none;background:var(--card);border-radius:3px;overflow:hidden;font-size:.85rem}
+.gal img{width:100%;height:6.5rem;object-fit:cover;display:block;background:var(--line)}.gal p{margin:.4rem .5rem .6rem}
+
+main{max-width:none;padding:1.25rem 1.75rem 3rem}
+.top{display:flex;gap:2rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:.5rem}
+.top h1{font-size:clamp(1.7rem,3vw,2.4rem);margin:0}.top .lead{margin:.3rem 0 0;font-size:.95rem}
+.search{flex:1 1 28rem;max-width:44rem}
+section{margin:1.4rem 0}.note{margin-top:1rem}
+#result{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:2rem;align-items:start;margin-top:1rem}
+#sources{position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow:auto;padding-right:.5rem}
+.wait{color:var(--muted);border:1px dashed var(--line);padding:1rem;border-radius:3px}
+@media (max-width:1000px){#result{grid-template-columns:1fr}#sources{position:static;max-height:none}}
+.cty{fill:var(--line);stroke:var(--paper);stroke-width:.4}.cty.on{fill:var(--sea)}
+.map .cnt{fill:var(--ink);font:700 13px var(--body);paint-order:stroke;stroke:var(--paper);stroke-width:3px}
+.tlmap text{fill:var(--muted)}.tlmap .lane{stroke-dasharray:2 3}
+.dot{fill:var(--sea);fill-opacity:.7;cursor:pointer}.dot:hover{fill-opacity:1}
+select{font:inherit;padding:.8rem .6rem;border:1.5px solid var(--ink);background:var(--card);color:var(--ink);border-radius:3px}
+
+body{background:radial-gradient(900px 420px at 90% -5%,color-mix(in srgb,var(--sea) 14%,transparent),transparent),var(--paper)}
+#b{background:var(--sea);color:#fff}
+section{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:8px;padding:1rem 1.2rem}
+section.conf{border-left-color:var(--sea)}section.conflict{border-left-color:var(--amber)}
+.side,.num,.gal a{background:var(--paper)}
+.map{background:var(--ocean)}.cty{fill:var(--land);stroke:var(--ocean)}.cty.on{fill:var(--sea)}
+.evs{margin-left:.4rem;padding-left:1.2rem;border-left:2px solid var(--line)}
+.evday{margin:1.1rem 0 .5rem;font:700 .95rem var(--head);color:var(--sea);position:relative}
+.evday::before{content:"";position:absolute;left:calc(-1.2rem - 7px);top:.3rem;width:12px;height:12px;border-radius:50%;background:var(--sea);box-shadow:0 0 0 4px var(--card)}
+.ev{background:var(--paper);border-radius:6px;padding:.6rem .8rem;margin:.4rem 0}
+.ev b{display:block;font-size:.85rem;color:var(--muted)}.ev p{margin:.2rem 0 .4rem}
+.evb{font-size:.78rem;font-weight:600;color:var(--good)}.evb.weak{color:var(--amber)}
+
+/* ---- temalar ---- */
+html[data-theme="gece"]{color-scheme:dark;--paper:#0E1014;--card:#16191F;--ink:#ECEFF4;--muted:#98A1B0;--line:#262B34;--sea:#FFB224;--amber:#FFB224;--good:#4CC38A;--bad:#FF6B5E;--land:#2B313B;--ocean:#11141A;--r:10px;--head:"Bricolage Grotesque","Segoe UI",system-ui,sans-serif}
+html[data-theme="okyanus"]{--paper:#EEF6F3;--card:#FFFFFF;--ink:#0F2A25;--muted:#53716A;--line:#CFE2DC;--sea:#0B7A6B;--amber:#C27C0E;--good:#1F8A5B;--bad:#C0432F;--land:#C5D8D1;--ocean:#E2F0EB;--r:12px;--head:"Bricolage Grotesque","Segoe UI",system-ui,sans-serif}
+html[data-theme="kum"]{--paper:#F8F3EB;--card:#FFFCF7;--ink:#2E2219;--muted:#7B6B5C;--line:#E6DAC9;--sea:#C0581A;--amber:#C78A12;--good:#2F8A6A;--bad:#C0432F;--land:#DDD0BD;--ocean:#F1E7D8;--r:8px;--head:"Bricolage Grotesque","Segoe UI",system-ui,sans-serif}
+html[data-theme="gece"] #b{color:#14110A}
+html[data-theme="gazete"] body{background:var(--paper)}
+html[data-theme="gazete"] section{background:transparent;border:0;border-top:2px solid var(--ink);border-radius:0;padding:.8rem 0 0}
+html[data-theme="gazete"] section.conf,html[data-theme="gazete"] section.conflict{border-top-color:var(--sea)}
+html[data-theme="gazete"] h2{font:700 .8rem var(--body);text-transform:uppercase;letter-spacing:.09em}
+input,select,button,.ev,.num,.gal a,.side,.map,section{border-radius:var(--r)}
+#hist button{border-radius:99px}
+.themes{margin-left:auto;display:flex;gap:.45rem;align-items:center}
+.sw{width:1.4rem;height:1.4rem;padding:0;border-radius:50%;border:2px solid var(--card);box-shadow:0 0 0 1px var(--line)}
+.sw.on{box-shadow:0 0 0 2px var(--ink)}
+.leadc{margin-bottom:1rem}
+.inside{margin:.9rem 0 0;padding-left:1rem;border-left:3px solid var(--sea)}
+.lbl{display:block;font:700 .72rem var(--body);letter-spacing:.09em;text-transform:uppercase;color:var(--sea);margin-bottom:.2rem}
+.stat{margin:.2rem 0 1.2rem}
+.ref{font:700 .62rem var(--body);vertical-align:super;background:var(--line);color:var(--ink);padding:.05rem .32rem;border-radius:5px;margin:0 .1rem;text-decoration:none;cursor:pointer}
+.ref:hover{background:var(--sea);color:var(--paper)}
+.ideas{display:grid;grid-template-columns:repeat(auto-fill,minmax(17rem,1fr));gap:1rem;margin:1rem 0}
+.idea{text-align:left;background:var(--card);color:var(--ink);border:1px solid var(--line);padding:1.1rem;display:flex;flex-direction:column;gap:.55rem;cursor:pointer;font-weight:400}
+.idea:hover{border-color:var(--sea)}
+.idea strong{font:700 1.2rem/1.25 var(--head)}.idea span{color:var(--muted);font-size:.92rem}
+.idea em{font-style:normal;color:var(--sea);font-weight:600;font-size:.9rem;margin-top:auto}
+.chips{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem}
+.chip{background:transparent;color:var(--ink);border:1px solid var(--sea);padding:.4rem .9rem;border-radius:99px;font-weight:600;text-align:left}
+.chip:hover{background:var(--sea);color:var(--paper)}
+.foot{margin-top:2rem;padding-top:1rem;border-top:1px solid var(--line);font-size:.85rem;color:var(--muted);max-width:60rem}
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div><h1><a href="/" style="color:inherit;text-decoration:none">Aynı haber, farklı ülkeler</a></h1><p class="lead">Bir konu yaz; ülkelerin haberlerini karşılaştırıp neyin ortak, neyin tartışmalı olduğunu gösterelim.</p></div>
+    <div class="search">
+      <form id="f">
+        <input id="q" placeholder="Örn. Kıbrıs doğalgaz arama çalışmaları" required minlength="3" maxlength="200" aria-label="Haber konusu">
+        <select id="w" aria-label="Zaman aralığı"><option value="1d">Son 24 saat</option><option value="7d">Son 7 gün</option><option value="30d" selected>Son 30 gün</option><option value="1y">Son 1 yıl</option><option value="">Tüm zamanlar</option></select>
+    <button id="b">Karşılaştır</button>
+      </form>
+      <div id="hist"></div>
+    </div>
+    <div id="themes" class="themes" role="group" aria-label="Tema"></div>
+  </header>
+  <p id="status" role="status"></p>
+  <div id="discover">
+    <h2>Bugün dünyada merak uyandıranlar</h2>
+    <p class="stat">Aklında bir konu yoksa buradan başla: aynı olayın farklı ülkelerde nasıl anlatıldığını keşfet.</p>
+    <div id="ideas" class="ideas"></div>
+    <p class="stat" id="dnote"></p>
+    <button id="rand" class="ghost" type="button">Beni şaşırt</button>
+  </div>
+  <div id="result"><div id="analysis"></div><div id="sources"></div></div>
+<footer class="foot">Bu site, haber başlıklarını ve haber metinlerinin ilk bölümünü yapay zekâ (Google Gemini) ile analiz eder; yazdığın konu da Google'a gönderilir. Analizler hata içerebilir, kaynaklardaki haberleri kendin de oku. Haber metinleri sitede saklanmaz ya da gösterilmez, yalnızca kaynağa bağlantı verilir.</footer>
+</main>
+<script>
+const NAMES={tr:"Türkçe",en:"İngilizce (ABD)","en-gb":"İngilizce (Birleşik Krallık)","en-in":"İngilizce (Hindistan)",de:"Almanca",fr:"Fransızca",ru:"Rusça",ar:"Arapça","ar-eg":"Arapça (Mısır)",es:"İspanyolca","es-mx":"İspanyolca (Meksika)"};
+const $=s=>document.querySelector(s);
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function block(title,cls){const s=el("section",cls);s.append(el("h2",null,title));return s}
+function goRef(n){const t=document.getElementById("h"+n);if(!t)return;
+  const d=t.closest("details");if(d)d.open=true;t.scrollIntoView({block:"center"});t.classList.add("hit");setTimeout(()=>t.classList.remove("hit"),2500)}
+function withRefs(text){ // "[3,7]" -> tıklanabilir kaynak numaraları
+  const f=document.createDocumentFragment();let last=0;
+  for(const m of String(text).matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)){
+    f.append(text.slice(last,m.index));
+    m[1].split(",").forEach((n,k)=>{n=n.trim();const a=el("a","ref",n);a.onclick=()=>goRef(n);f.append(a)});
+    last=m.index+m[0].length}
+  f.append(text.slice(last));return f}
+function list(arr){const u=el("ul");arr.forEach(t=>{const li=el("li");li.append(withRefs(t));u.append(li)});return u}
+
+let ITEMS=[];
+const GEO={tr:[35,39,"TR"],en:[-98,39,"ABD"],"en-gb":[-2,54,"BK"],"en-in":[78,22,"HİN"],de:[10,51,"DE"],fr:[2,46,"FR"],ru:[40,56,"RU"],ar:[54,24,"BAE"],"ar-eg":[30,27,"MSR"],es:[-4,40,"ES"],"es-mx":[-102,23,"MEX"]};
+const svg=(tag,at,text)=>{const e=document.createElementNS("http://www.w3.org/2000/svg",tag);for(const k in at)e.setAttribute(k,at[k]);if(text!=null)e.textContent=text;return e};
+const ISO={tr:"792",en:"840","en-gb":"826","en-in":"356",de:"276",fr:"250",ru:"643",ar:"784","ar-eg":"818",es:"724","es-mx":"484"};
+let WORLD=null;
+async function upgradeMap(box,cnt){
+  try{
+    if(!window.d3||!window.topojson)return;
+    WORLD=WORLD||fetch("https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json").then(r=>{if(!r.ok)throw new Error("harita");return r.json()});
+    const w=await WORLD,W=960,H=480,feats=topojson.feature(w,w.objects.countries).features;
+    const proj=d3.geoNaturalEarth1().fitSize([W,H],{type:"FeatureCollection",features:feats}),path=d3.geoPath(proj);
+    const m=svg("svg",{viewBox:`0 0 ${W} ${H}`,class:"map",role:"img","aria-label":"Ülkelere göre haber sayısı"}),pe={};
+    feats.forEach(f=>{const p=svg("path",{d:path(f)||"",class:"cty"});pe[String(f.id)]=p;m.append(p)});
+    const mx=Math.max(...Object.values(cnt));
+    Object.keys(cnt).forEach(l=>{const p=pe[ISO[l]];if(!p)return;
+      p.setAttribute("class","cty on");p.style.fillOpacity=.3+.7*cnt[l]/mx;p.append(svg("title",{},NAMES[l]+": "+cnt[l]+" haber"));
+      const xy=GEO[l]&&proj(GEO[l]);if(xy)m.append(svg("text",{x:xy[0],y:xy[1]+4,"text-anchor":"middle",class:"cnt"},String(cnt[l])))});
+    box.replaceChildren(m);
+  }catch(e){WORLD=null;console.warn("Harita yüklenemedi, nokta haritası gösteriliyor",e)}
+}
+function barList(rows){const mx=Math.max(...rows.map(r=>r[1])),d=el("div","bars");
+  rows.forEach(([k,v])=>{const r=el("div"),b=el("span");b.style.width=(100*v/mx)+"%";r.append(el("em",null,k),b,el("b",null,String(v)));d.append(r)});return d}
+const REFS=/\[(\d+(?:\s*,\s*\d+)*)\]/g;
+function heatmap(claims){ // iddia x ülke sürümü tablosu; kaynak numaralarından türetilir
+  const cols=Object.keys(NAMES).filter(l=>ITEMS.some(i=>i.lang===l));
+  const rows=claims.map(t=>{const c={};
+    for(const m of String(t).matchAll(REFS))m[1].split(",").forEach(n=>{const it=ITEMS[+n-1];if(it)c[it.lang]=(c[it.lang]||0)+1});
+    return {t:String(t).replace(/\s*\[[\d,\s]+\]/g,"").trim(),c}}).filter(r=>Object.keys(r.c).length);
+  if(!rows.length||cols.length<2)return null;
+  const s=block("Hangi iddiayı hangi ülke sürümü destekliyor?"),g=el("div","heat");
+  g.style.gridTemplateColumns="minmax(10rem,1fr) repeat("+cols.length+",1.9rem)";
+  g.append(el("span"));cols.forEach(l=>{const h=el("span","hc",GEO[l]?GEO[l][2]:l);h.title=NAMES[l];g.append(h)});
+  rows.forEach(r=>{const lab=el("span","hl",r.t.length>110?r.t.slice(0,107)+"…":r.t);lab.title=r.t;g.append(lab);
+    cols.forEach(l=>{const n=r.c[l]||0,cell=el("span","hx",n?String(n):"");
+      if(n)cell.style.background="color-mix(in srgb, var(--sea) "+Math.min(35+n*20,90)+"%, transparent)";g.append(cell)})});
+  s.append(g,el("p","note","Sayı, o sürümden iddiayı destekleyen haber sayısıdır. Kaynak numaralarını yapay zekâ verir, hatalı eşleşme olabilir."));
+  return s}
+function renderViz(items){
+  const cnt={};items.forEach(i=>cnt[i.lang]=(cnt[i.lang]||0)+1);
+  const s=block("Haberler nereden geliyor?"),W=720,H=300,mx=Math.max(...Object.values(cnt));
+  const m=svg("svg",{viewBox:`0 0 ${W} ${H}`,class:"map",role:"img","aria-label":"Haber sürümlerinin ülkelere göre dağılımı"});
+  for(let lo=-180;lo<=180;lo+=30){const x=(lo+180)/360*W;m.append(svg("line",{x1:x,x2:x,y1:0,y2:H}))}
+  for(let la=60;la>=-30;la-=30){const y=(75-la)/120*H;m.append(svg("line",{y1:y,y2:y,x1:0,x2:W}))}
+  Object.entries(GEO).forEach(([l,[lo,la,t]])=>{if(!cnt[l])return;
+    const x=(lo+180)/360*W,y=(75-la)/120*H,c=svg("circle",{cx:x,cy:y,r:4+10*cnt[l]/mx});
+    c.append(svg("title",{},NAMES[l]+": "+cnt[l]+" haber"));m.append(c,svg("text",{x:x+8,y:y-8},t))});
+  const box=el("div","mapbox");box.append(m);s.append(box);upgradeMap(box,cnt);
+  const bars=el("div","bars");
+  Object.keys(NAMES).filter(l=>cnt[l]).sort((a,b)=>cnt[b]-cnt[a]).forEach(l=>{
+    const r=el("div"),bar=el("span");bar.style.width=(100*cnt[l]/mx)+"%";
+    r.append(el("em",null,NAMES[l]),bar,el("b",null,String(cnt[l])));bars.append(r)});
+  s.append(bars);
+  const bySrc={};items.forEach(i=>bySrc[i.source]=(bySrc[i.source]||0)+1);
+  const top=Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  if(top.length&&top[0][1]>1)s.append(el("h2",null,"En çok haberi olan yayıncılar"),barList(top));
+  s.append(el("p","note","Harita, Google News sürümünün ülkesini gösterir; bir haberin yayıncısı başka ülkeden olabilir. Renk koyulaştıkça o sürümden daha çok haber var (harita yüklenemezse nokta haritası görünür)."));
+  return s}
+function eventTimeline(ev){
+  const s=block("Olayın zaman çizelgesi"),box=el("div","evs");
+  const ord=[...ev].sort((a,b)=>(a.iso||"9999").localeCompare(b.iso||"9999"));
+  let last=null;
+  ord.forEach(x=>{
+    if(x.iso!==last){last=x.iso;box.append(el("h3","evday",x.iso?new Date(x.iso+"T00:00:00").toLocaleDateString("tr-TR",{day:"numeric",month:"long",year:"numeric"}):"Tarihi belirsiz"))}
+    const src=new Set(),langs=new Set();
+    for(const m of String(x.what).matchAll(REFS))m[1].split(",").forEach(n=>{const it=ITEMS[+n-1];if(it){src.add(it.source);langs.add(it.lang)}});
+    const d=el("div","ev"),p=el("p"),bd=el("span","evb"+(src.size===1?" weak":""),src.size?src.size+" kaynak · "+langs.size+" ülke sürümü":"kaynak belirtilmemiş");
+    p.append(withRefs(x.what));d.append(el("b",null,x.when),p,bd);box.append(d)});
+  s.append(box,el("p","note","Aşamaları ve tarihlerini yapay zekâ haber metinlerinden çıkarır; tarih kesin değilse \"yaklaşık\" yazar. Rozet, aşamayı destekleyen farklı yayıncı sayısını gösterir."));
+  return s}
+function renderAnalysis(a){
+  const r=$("#analysis");r.replaceChildren();
+  (a.read||[]).forEach(n=>{const li=document.getElementById("h"+n);if(li&&!li.querySelector(".tick"))li.append(el("span","tick"," ✓ metin okundu"))});
+  const lead=el("div","leadc"),sp=el("p","summary");sp.append(withRefs(a.summary));lead.append(sp);
+  if(a.inside){const ip=el("p","inside");ip.append(el("span","lbl","Olayın iç yüzü"),withRefs(a.inside));lead.append(ip)}
+  r.append(lead);
+  if(a.stats){const L={decode:"adres çözülemedi",fetch:"sayfa açılmadı veya engellendi",short:"metin çok kısa (ücretli olabilir)",type:"HTML değil",timeout:"zaman aşımı"};
+    const w=Object.entries(a.stats.why||{}).filter(([k])=>k!=="ok").map(([k,v])=>(L[k]||k)+": "+v).join(", ");
+    r.append(el("p","stat",a.stats.read+"/"+a.stats.tried+" haberin metni okundu"+(w?" ("+w+")":"")+"."))}
+
+  const c=block("Güven düzeyi","conf");
+  const lvl=el("span","level "+a.confidence.level,a.confidence.level);
+  const p=el("p");p.append(lvl," ",document.createTextNode(a.confidence.reason));
+  const lv=["Düşük","Orta","Yüksek"].indexOf(a.confidence.level),g=el("div","gauge");
+  g.style.setProperty("--c",["var(--bad)","var(--amber)","var(--good)"][lv]);
+  [0,1,2].forEach(k=>g.append(el("i",k<=lv?"on":"")));
+  c.append(p,g);r.append(c);
+  if(a.timeline?.length)r.append(eventTimeline(a.timeline));
+  const imgs=Object.entries(a.images||{}).filter(([n,u])=>ITEMS[n-1]&&/^https:\/\//.test(u)).slice(0,8);
+  if(imgs.length){const s=block("Haberlerden görseller"),gl=el("div","gal");
+    imgs.forEach(([n,u])=>{const it=ITEMS[n-1],card=el("a");card.href=it.link;card.target="_blank";card.rel="noopener noreferrer";
+      const im=el("img");im.src=u;im.alt="";im.loading="lazy";im.referrerPolicy="no-referrer";im.onerror=()=>card.remove();
+      card.append(im,el("p",null,it.source+": "+it.title));gl.append(card)});
+    s.append(gl);r.append(s)}
+
+  if(a.numbers?.length){const s=block("Öne çıkan rakamlar"),g=el("div","nums");
+    a.numbers.forEach(x=>{const d=el("div","num");d.append(el("b",null,x.value.slice(0,24)));const p=el("p");p.append(withRefs(x.label));d.append(p);g.append(d)});
+    s.append(g);r.append(s)}
+  if(a.facts?.length){const s=block("Öne çıkan somut bilgiler");s.append(list(a.facts));r.append(s)}
+  if(a.common?.length){const s=block("Birden çok kaynakta ortak");s.append(list(a.common));r.append(s)}
+  if(a.common?.length){const hm=heatmap(a.common);if(hm)r.append(hm)}
+  if(a.by_country?.length){const s=block("Ülke ve dile göre anlatı"),u=el("ul");
+    a.by_country.forEach(x=>{const li=el("li");li.append(el("b",null,x.who+": "),withRefs(x.says));u.append(li)});s.append(u);r.append(s)}
+  if(a.conflicts?.length){
+    const s=block("Kaynaklar burada ayrışıyor","conflict");
+    a.conflicts.forEach(x=>{
+      s.append(el("p","claim",x.claim));
+      const g=el("div","sides");
+      x.sides.forEach(y=>{const sd=el("div","side");sd.append(el("b",null,y.who),withRefs(y.says));g.append(sd)});
+      s.append(g);
+    });
+    r.append(s);
+  }
+  if(a.framing?.length){const s=block("Çerçeveleme farkları");s.append(list(a.framing));r.append(s)}
+  if(a.unverified?.length){const s=block("Tek kaynaklı veya doğrulanmamış");s.append(list(a.unverified));r.append(s)}
+  if(a.missing?.length){const s=block("Başlıklardan anlaşılamayanlar");s.append(list(a.missing));r.append(s)}
+
+  if(a.curious?.length){const s=block("Sırada ne merak edersin?"),w=el("div","chips");
+    a.curious.slice(0,4).forEach(x=>{if(!x.query)return;const b=el("button","chip",x.q||x.query);b.type="button";b.onclick=()=>{$("#q").value=x.query;run(x.query);window.scrollTo(0,0)};w.append(b)});
+    s.append(w);r.append(s)}
+  const cp=el("button","ghost","Bağlantıyı kopyala");
+  cp.onclick=async()=>{try{await navigator.clipboard.writeText(location.href);cp.textContent="Kopyalandı"}catch{cp.textContent="Adres çubuğundan kopyala"}};
+  r.append(cp);
+  r.append(el("p","note","Bu analiz yalnızca taranan başlıklara dayanır ve kesin doğruyu ilan etmez. Güven düzeyi, kaynakların birbiriyle tutarlılığını gösterir. Önemli konularda bağlantılardaki haberleri kendin de oku."));
+}
+
+function srcLi(i){const li=el("li");li.id="h"+i.n;
+  const link=el("a",null,i.n+". "+i.title+" ("+i.source+(i.bg&&i.ts?", "+new Date(i.ts*1000).toLocaleDateString("tr-TR",{month:"short",year:"numeric"}):"")+")");
+  if(/^https?:\/\//.test(i.link)){link.href=i.link;link.target="_blank";link.rel="noopener noreferrer"}
+  li.append(link);return li}
+function renderSources(items){
+  items.forEach((i,k)=>i.n=k+1);ITEMS=items;
+  const src=block("Taranan haberler");
+  Object.keys(NAMES).forEach(l=>{
+    const its=items.filter(i=>i.lang===l&&!i.bg);if(!its.length)return;
+    const det=el("details");det.append(el("summary",null,`${NAMES[l]} (${its.length})`));
+    const u=el("ul");
+    its.forEach(i=>u.append(srcLi(i)));
+    det.append(u);src.append(det);
+  });
+  const qs={};items.forEach(i=>{if(!i.bg&&i.q)qs[i.lang]=i.q});
+  if(Object.keys(qs).length){const det=el("details"),u=el("ul");det.append(el("summary",null,"Hangi ifadelerle arandı?"));
+    Object.keys(NAMES).filter(l=>qs[l]).forEach(l=>u.append(el("li",null,NAMES[l]+": "+qs[l])));det.append(u);src.append(det)}
+  const bg=items.filter(i=>i.bg);
+  if(bg.length){const det=el("details"),u=el("ul");det.append(el("summary",null,"Arka plan: olayın geçmişi için eski haberler ("+bg.length+")"));
+    bg.forEach(i=>u.append(srcLi(i)));det.append(u);src.append(det)}
+  $("#sources").replaceChildren(renderViz(items.filter(i=>!i.bg)),src);
+}
+
+let ctl;
+async function post(url,q,signal){
+  const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q,window:$("#w").value}),signal});
+  const d=await res.json().catch(()=>({}));
+  if(!res.ok){const dt=d.detail,e=new Error(dt&&dt.message?dt.message:(typeof dt==="string"?dt:"Bir hata oluştu."));if(dt&&dt.suggestions)e.suggestions=dt.suggestions;throw e}
+  return d;
+}
+function hist(){try{return JSON.parse(localStorage.getItem("gecmis")||"[]")}catch{return[]}}
+function saveHist(q){try{localStorage.setItem("gecmis",JSON.stringify([q,...hist().filter(x=>x!==q)].slice(0,8)))}catch{}drawHist()}
+function drawHist(){const h=$("#hist");h.replaceChildren();
+  hist().forEach(q=>{const b=el("button",null,q);b.type="button";b.onclick=()=>{$("#q").value=q;run(q)};h.append(b)})}
+async function run(q){
+  ctl?.abort();ctl=new AbortController();
+  const st=$("#status"),b=$("#b"),sig=ctl.signal;
+  st.className="";st.textContent="Haberler taranıyor...";b.disabled=true;$("#discover").hidden=true;
+  $("#analysis").replaceChildren();$("#sources").replaceChildren();
+  try{
+    const n=await post("/api/news",q,sig);renderSources(n.items);
+    $("#analysis").replaceChildren(el("p","wait","Analiz hazırlanıyor: haber metinleri okunuyor ve karşılaştırılıyor..."));
+    st.textContent=n.items.filter(i=>!i.bg).length+" güncel haber bulundu"+(n.items.some(i=>i.bg)?" (+ geçmiş için "+n.items.filter(i=>i.bg).length+" eski haber)":"")+". Haber metinleri okunuyor ve analiz ediliyor (yaklaşık bir dakika sürebilir)...";
+    const d=await post("/api/analyze",q,sig);renderAnalysis(d.analysis);st.textContent="";
+    saveHist(q);history.replaceState(null,"","?q="+encodeURIComponent(q)+"&w="+$("#w").value);
+  }catch(err){if(err.name!=="AbortError"){st.className="err";st.textContent=err.message;
+    const an=$("#analysis");an.replaceChildren();
+    if(err.suggestions?.length){const w=el("div","chips");err.suggestions.forEach(s=>{const b=el("button","chip",s);b.type="button";b.onclick=()=>{$("#q").value=s;run(s)};w.append(b)});an.append(el("p","wait","Şunlardan birini dene:"),w)}
+    $("#discover").hidden=false;if(!IDEAS.length)loadIdeas()}}
+  finally{if(!sig.aborted)b.disabled=false}
+}
+$("#f").addEventListener("submit",e=>{e.preventDefault();run($("#q").value.trim())});
+let IDEAS=[];
+const FALLBACK=[
+ {question:"Yapay zekâ düzenlemeleri ülkelere göre neden bu kadar farklı?",hook:"AB, ABD ve Çin aynı teknolojiye çok farklı yaklaşıyor.",query:"yapay zekâ düzenlemesi"},
+ {question:"İklim zirvelerinden gerçekte ne çıkıyor?",hook:"Aynı zirve, ülkeye göre başarı ya da hayal kırıklığı olarak anlatılıyor.",query:"iklim zirvesi"},
+ {question:"Küresel ekonomide enflasyon neden hâlâ gündemde?",hook:"Merkez bankalarının kararları ülkelerde farklı okunuyor.",query:"enflasyon merkez bankası faiz"},
+ {question:"Uzay yarışında kim önde?",hook:"NASA, Çin ve özel şirketler haberlerde farklı çerçeveleniyor.",query:"uzay yarışı ay görevi"},
+ {question:"Bir salgın haberi ülkelere nasıl farklı yansır?",hook:"Aynı sağlık haberinde ton ve vurgu ülkeden ülkeye değişiyor.",query:"salgın hastalık dünya sağlık örgütü"},
+ {question:"Enerji dönüşümünde kim ne kazanıyor?",hook:"Petrol, güneş ve nükleer haberleri ülkelerde başka anlatılıyor.",query:"enerji dönüşümü"}];
+function renderIdeas(ideas,live){
+  const box=$("#ideas");box.replaceChildren();
+  ideas.forEach(x=>{const b=el("button","idea");b.type="button";b.append(el("strong",null,x.question),el("span",null,x.hook),el("em",null,"Araştır →"));
+    b.onclick=()=>{$("#q").value=x.query;run(x.query)};box.append(b)});
+  $("#dnote").textContent=live?"Bu fikirler şu an farklı ülkelerin ana sayfalarındaki başlıklardan seçildi.":"Gündem şu an alınamadı; hazır fikirler gösteriliyor."}
+async function loadIdeas(){
+  $("#ideas").replaceChildren(el("p","wait","Bugünün gündemi taranıyor, merak uyandıran konular seçiliyor..."));
+  let ideas=FALLBACK,live=false;
+  try{const r=await fetch("/api/ideas");if(r.ok){const d=await r.json();if(d.ideas?.length){ideas=d.ideas;live=true}}}catch{}
+  IDEAS=ideas;renderIdeas(ideas,live);$("#q").placeholder="Örn. "+ideas[0].query}
+$("#rand").onclick=()=>{const x=IDEAS[Math.floor(Math.random()*IDEAS.length)];if(x){$("#q").value=x.query;run(x.query)}};
+const THEMES=[["gazete","Gazete","#C8102E"],["gece","Gece","#FFB224"],["okyanus","Okyanus","#0B7A6B"],["kum","Kum","#C0581A"]];
+function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem("tema",t)}catch{}
+  const d=$("#themes");d.replaceChildren();
+  THEMES.forEach(([k,n,c])=>{const b=el("button","sw"+(k===t?" on":""));b.type="button";b.title=n;b.setAttribute("aria-label",n+" teması");b.style.background=c;b.onclick=()=>setTheme(k);d.append(b)})}
+let t0=null;try{t0=localStorage.getItem("tema")}catch{}
+setTheme(THEMES.some(x=>x[0]===t0)?t0:"gece");
+drawHist();
+const w0=new URLSearchParams(location.search).get("w");
+if(["1d","7d","30d","1y",""].includes(w0))$("#w").value=w0;
+const p0=new URLSearchParams(location.search).get("q");
+if(p0&&p0.length>=3){$("#q").value=p0;run(p0)}else loadIdeas();
+</script>
+</body>
+</html>

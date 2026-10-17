@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+feedparser
+httpx
+gnews-decoder
+trafilatura
