@@ -84,7 +84,118 @@ news_memo, analysis_memo = Memo(TTL), Memo(TTL)
 norm = lambda q: re.sub(r"\s+", " ", q.strip().replace("İ", "i").lower())
 
 
-async def _gemini(model, system, user, max_tokens):
+_INJECTION_PATTERNS = (
+    re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions", re.I),
+    re.compile(r"system\s*prompt\s*override", re.I),
+    re.compile(r"you\s+are\s+now\s+in\s+developer\s+mode", re.I),
+    re.compile(r"<\s*/?\s*(?:system|instruction|admin_override|prompt)\s*>", re.I),
+)
+
+_ANTIBOT_MARKERS = (
+    "just a moment...",
+    "cf-browser-verification",
+    "attention required! | cloudflare",
+    "enable javascript and cookies to continue",
+    "verify you are human",
+    "_cf_chl_opt",
+)
+
+
+def scrub_url_credentials(text):
+    """Metin veya URL içindeki user:pass@ ve ?token=/api_key= kimlik bilgilerini maskeler (Agent-Reach güvenlik katmanı)."""
+    s = str(text or "")
+    s = re.sub(r"(https?://)([^/\s:@]+:[^/\s@]+@)", r"\1***@", s)
+    s = re.sub(r"([?&](?:api_key|apikey|token|access_token|secret|password|key)=)[^&\s]+", r"\1***", s, flags=re.I)
+    return s
+
+
+def is_antibot_page(html_text):
+    """Cloudflare / CAPTCHA / anti-bot engel sayfası olup olmadığını tespit eder."""
+    low = str(html_text or "")[:15000].lower()
+    return any(m in low for m in _ANTIBOT_MARKERS)
+
+
+def sanitize_untrusted_text(text):
+    """Dış kaynaklı (RSS/web) metinlerdeki dolaylı komut enjeksiyonu (indirect prompt injection) kalıplarını etkisizleştirir."""
+    s = scrub_url_credentials(text)
+    s = re.sub(r"<\s*(/?)\s*(system|instruction|haber|untrusted_data)\b[^>]*>", r"[\1\2]", s, flags=re.I)
+    for pat in _INJECTION_PATTERNS:
+        s = pat.sub("[ENJEKSIYON_FILTRELENDI]", s)
+    return s
+
+
+def wrap_untrusted_input(text, source="rss"):
+    """Güvenilmeyen dış veriyi [UNTRUSTED_DATA] zarfına alır ve komut enjeksiyonu taraması yapar."""
+    raw = str(text or "")
+    flagged = any(p.search(raw) for p in _INJECTION_PATTERNS)
+    clean = sanitize_untrusted_text(raw)
+    src_attr = re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(source or "rss"))[:40]
+    bayrak = "true" if flagged else "false"
+    zarf = "[UNTRUSTED_DATA source=" + src_attr + " injection_flagged=" + bayrak + "]\n" + clean + "\n[/UNTRUSTED_DATA]"
+    return {
+        "wrapped": zarf,
+        "clean": clean,
+        "injection_flagged": flagged,
+    }
+
+
+def verify_number_traceability(output_numbers, items, texts=None):
+    """Üretilen rakamların (numbers) kaynak başlık veya metinlerde izi olup olmadığını doğrular (Neon DONE WHEN kuralı)."""
+    texts = texts or {}
+    corpus = " ".join(
+        [str(i.get("title", "")) for i in (items or [])]
+        + [str(v) for v in texts.values()]
+    )
+    corpus_norm = norm(corpus)
+    corpus_digits = re.sub(r"[.,\s]", "", corpus_norm)
+    traced, untraced = [], []
+    for entry in (output_numbers or []):
+        val = str(entry.get("value", "") if isinstance(entry, dict) else entry).strip()
+        if not val:
+            continue
+        tokens_num = re.findall(r"\d+(?:[.,]\d+)?", val)
+        if not tokens_num:
+            traced.append(val)
+            continue
+        ok = all(
+            (t in corpus_norm) or (re.sub(r"[.,]", "", t) in corpus_digits)
+            for t in tokens_num
+        )
+        if ok:
+            traced.append(val)
+        else:
+            untraced.append(val)
+    total = len(traced) + len(untraced)
+    return {
+        "verified": len(untraced) == 0,
+        "score": round(100 * len(traced) / total) if total else 100,
+        "traced": traced,
+        "untraced": untraced,
+    }
+
+
+def resolve_thinking_level(step="write", model=""):
+    """Adım türüne göre Gemini 4 düşünme seviyesini (LOW/MEDIUM/HIGH/XHIGH) belirler."""
+    s = str(step or "write").lower()
+    if s in ("fast", "sort", "classify", "translate", "route"):
+        return "LOW"
+    if s in ("extract", "parse", "summarize"):
+        return "MEDIUM"
+    if s in ("audit", "verify", "critic"):
+        return "XHIGH"
+    return "HIGH"
+
+
+def build_gemini_generation_config(model, max_tokens, step="write"):
+    """Gemini 4 serisi için temperature ve eski thinking_budget parametrelerini kaldırıp thinkingLevel uygular."""
+    cfg = {"maxOutputTokens": max_tokens * 2, "responseMimeType": "application/json"}
+    m = str(model or "").lower()
+    if m.startswith("gemini-4"):
+        cfg["thinkingConfig"] = {"thinkingLevel": resolve_thinking_level(step, m)}
+    return cfg
+
+
+async def _gemini(model, system, user, max_tokens, step="write"):
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:  # anahtar yoksa ham KeyError yerine anlaşılır hata (503)
         raise NewsError("Gemini anahtarı tanımlı değil. GEMINI_API_KEY ortam değişkenini ayarlayıp sunucuyu yeni bir terminalden başlatın.", 503)
@@ -93,7 +204,7 @@ async def _gemini(model, system, user, max_tokens):
         headers={"x-goog-api-key": key},
         json={"systemInstruction": {"parts": [{"text": system}]},
               "contents": [{"role": "user", "parts": [{"text": user}]}],
-              "generationConfig": {"maxOutputTokens": max_tokens * 2, "responseMimeType": "application/json"}})
+              "generationConfig": build_gemini_generation_config(model, max_tokens, step=step)})
     r.raise_for_status()
     return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
 
@@ -122,7 +233,10 @@ async def _anthropic(model, system, user, max_tokens):
 
 async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
     main, fast = MODELS[PROVIDER]
-    call = {"gemini": _gemini, "ollama": _ollama, "anthropic": _anthropic}[PROVIDER]
+    if PROVIDER == "gemini":
+        step = "fast" if kind == "fast" else "write"
+        return await _gemini(fast if kind == "fast" else main, system, user, max_tokens, step=step)
+    call = {"ollama": _ollama, "anthropic": _anthropic}[PROVIDER]
     return await call(fast if kind == "fast" else main, system, user, max_tokens)
 
 
