@@ -309,13 +309,38 @@ function renderAnalysis(a){
   r.append(el("p","note","Bu analiz yalnızca taranan başlıklara dayanır ve kesin doğruyu ilan etmez. Güven düzeyi, kaynakların birbiriyle tutarlılığını gösterir. Önemli konularda bağlantılardaki haberleri kendin de oku."));
 }
 
-function srcLi(i){const li=el("li");li.id="h"+i.n;
+const SIG_LBL={acil:"ACİL",kritik:"KRİTİK",pozitif:"POZİTİF",negatif:"NEGATİF"};
+function srcLi(i){const li=el("li");li.id="h"+i.n;li.dataset.sig=i.signal||"normal";li.dataset.txt=(i.title+" "+i.source+" "+i.lang).toLowerCase();
+  if(i.signal&&SIG_LBL[i.signal]){const b=el("span","chip",SIG_LBL[i.signal]+" · "+i.impact_score);b.style.marginRight=".4rem";b.style.fontSize=".72rem";li.append(b)}
   const link=el("a",null,i.n+". "+i.title+" ("+i.source+(i.bg&&i.ts?", "+new Date(i.ts*1000).toLocaleDateString("tr-TR",{month:"short",year:"numeric"}):"")+")");
   if(/^https?:\/\//.test(i.link)){link.href=i.link;link.target="_blank";link.rel="noopener noreferrer"}
   li.append(link);return li}
+function downloadBlob(content,filename,type){
+  const a=el("a");a.href=URL.createObjectURL(new Blob([content],{type}));a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
 function renderSources(items){
   items.forEach((i,k)=>i.n=k+1);ITEMS=items;
   const src=block("Taranan haberler");
+  const tools=el("div","chips");tools.style.marginBottom=".75rem";
+  const kwIn=el("input");kwIn.type="search";kwIn.placeholder="Çoklu anahtar kelime filtrele (virgülle ayır)...";kwIn.style.flex="1";kwIn.style.minWidth="14rem";
+  const sigSel=el("select");[["","Tüm sinyaller"],["acil","Acil"],["kritik","Kritik"],["negatif","Negatif"],["pozitif","Pozitif"]].forEach(([v,t])=>{const o=el("option",null,t);o.value=v;sigSel.append(o)});
+  const btnCsv=el("button","chip","CSV İndir");btnCsv.type="button";
+  const btnJson=el("button","chip","JSON İndir");btnJson.type="button";
+  const applyFilter=()=>{
+    const kws=kwIn.value.toLowerCase().split(/[,;]+/).map(s=>s.trim()).filter(Boolean),sg=sigSel.value;
+    src.querySelectorAll("li[id^='h']").forEach(li=>{
+      const okSig=!sg||li.dataset.sig===sg;
+      const okKw=!kws.length||kws.some(k=>(li.dataset.txt||"").includes(k));
+      li.hidden=!(okSig&&okKw);
+    });
+  };
+  kwIn.oninput=applyFilter;sigSel.onchange=applyFilter;
+  btnCsv.onclick=()=>{
+    const rows=[["n","lang","source","date","signal","impact_score","title","link"],...ITEMS.map(i=>[i.n,i.lang,i.source,i.date||"",i.signal||"normal",i.impact_score||20,`"${String(i.title||"").replace(/"/g,'""')}"`,i.link||""])];
+    downloadBlob(rows.map(r=>r.join(",")).join("\n"),"istihbarat-raporu.csv","text/csv;charset=utf-8");
+  };
+  btnJson.onclick=()=>downloadBlob(JSON.stringify({count:ITEMS.length,items:ITEMS},null,2),"istihbarat-raporu.json","application/json;charset=utf-8");
+  tools.append(kwIn,sigSel,btnCsv,btnJson);src.append(tools);
   Object.keys(NAMES).forEach(l=>{
     const its=items.filter(i=>i.lang===l&&!i.bg);if(!its.length)return;
     const det=el("details");det.append(el("summary",null,`${NAMES[l]} (${its.length})`));

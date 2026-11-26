@@ -383,6 +383,48 @@ class AppTest(unittest.TestCase):
             )
             self.assertEqual(app_mod.client_ip(req), "9.8.7.6")
 
+    def test_impact_scoring_filtering_and_export(self):
+        from fastapi.testclient import TestClient
+        import app as app_mod
+
+        s_acil = core.score_item("SON DAKİKA: Kritik deprem ve patlama alarmı")
+        self.assertEqual(s_acil["signal"], "acil")
+        self.assertIn("kritik", s_acil["signals"])
+        self.assertGreaterEqual(s_acil["impact_score"], 90)
+
+        s_poz = core.score_item("Yeni barış anlaşması ve rekor büyüme yatırımı")
+        self.assertIn("pozitif", s_poz["signals"])
+
+        items = [
+            {"n": 1, "lang": "tr", "source": "AA", "date": "12.10", "title": "Son dakika deprem uyarısı", "link": "https://a", **core.score_item("Son dakika deprem uyarısı")},
+            {"n": 2, "lang": "en", "source": "Reuters", "date": "12.10", "title": "Peace investment growth", "link": "https://b", **core.score_item("Peace investment growth")},
+            {"n": 3, "lang": "de", "source": "DW", "date": "12.10", "title": "Normaler Bericht", "link": "https://c", **core.score_item("Normaler Bericht")},
+        ]
+        self.assertEqual(len(core.filter_items(items, signal="acil")), 1)
+        self.assertEqual(len(core.filter_items(items, keywords="reuters, dw")), 2)
+        self.assertEqual(len(core.filter_items(items, keywords="deprem", signal="acil")), 1)
+
+        csv_out = core.export_items_csv(items)
+        self.assertIn("n,lang,source,date,signal,impact_score,title,link", csv_out)
+        self.assertIn("Son dakika deprem uyarısı", csv_out)
+
+        json_out = json.loads(core.export_items_json(items))
+        self.assertEqual(json_out["count"], 3)
+        self.assertEqual(json_out["items"][0]["signal"], "acil")
+
+        client = TestClient(app_mod.app)
+        app_mod.limiter.hits.clear()
+        with patch.object(core, "get_news", return_value=items):
+            r_csv = client.post("/api/export", json={"query": "deprem", "keywords": "deprem", "signal": "acil", "format": "csv"})
+            self.assertEqual(r_csv.status_code, 200)
+            self.assertIn("text/csv", r_csv.headers.get("content-type", ""))
+            self.assertIn("Son dakika deprem uyarısı", r_csv.text)
+            self.assertNotIn("Normaler Bericht", r_csv.text)
+
+            r_json = client.post("/api/export", json={"query": "deprem", "format": "json"})
+            self.assertEqual(r_json.status_code, 200)
+            self.assertEqual(r_json.json()["count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

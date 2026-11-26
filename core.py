@@ -151,6 +151,84 @@ async def translate(query):
     return {l: d.get(l.split("-")[0]) or query for l in LANGS}, None
 
 
+_SIGNALS = {
+    "acil": ("son dakika", "acil", "breaking", "urgent", "flash", "alarm", "deprem", "earthquake", "patlama", "explosion", "saldırı", "attack", "olağanüstü", "emergency"),
+    "kritik": ("kritik", "critical", "savaş", "war", "kriz", "crisis", "yaptırım", "sanction", "çöküş", "collapse", "iflas", "bankruptcy", "tehlike", "catastrophe", "rekor", "record"),
+    "pozitif": ("anlaşma", "barış", "peace", "büyüme", "growth", "başarı", "success", "rekor artış", "iyileşme", "recovery", "onay", "approved", "yatırım", "investment", "işbirliği"),
+    "negatif": ("düşüş", "kayıp", "loss", "ölüm", "dead", "killed", "gerilim", "tension", "çatışma", "conflict", "enflasyon", "inflation", "yasak", "ban", "tehdit", "threat", "zarar"),
+}
+
+
+def score_item(title: str) -> dict:
+    """Başlıktan hızlı etki/aciliyet sinyali (acil, kritik, pozitif, negatif) ve 0-100 etki puanı üretir."""
+    low = norm(title or "")
+    tags = []
+    for sig, words in _SIGNALS.items():
+        if any(w in low for w in words):
+            tags.append(sig)
+    score = 20
+    if "acil" in tags:
+        score += 45
+    if "kritik" in tags:
+        score += 25
+    if "negatif" in tags:
+        score += 10
+    if "pozitif" in tags:
+        score += 10
+    return {"signal": tags[0] if tags else "normal", "signals": tags or ["normal"], "impact_score": min(100, score)}
+
+
+def filter_items(items, keywords="", signal=""):
+    """Çoklu anahtar kelime (virgül/boşluk ayrılmış) ve sinyal etiketine göre haberleri süzer."""
+    kws = [norm(k) for k in re.split(r"[,;]+", keywords or "") if norm(k)]
+    sig = norm(signal or "")
+    out = []
+    for it in items or []:
+        if sig and sig != "all":
+            it_sigs = it.get("signals") or [it.get("signal", "normal")]
+            if sig not in it_sigs and it.get("signal") != sig:
+                continue
+        if kws:
+            hay = norm(f"{it.get('title', '')} {it.get('source', '')} {it.get('lang', '')}")
+            if not any(k in hay for k in kws):
+                continue
+        out.append(it)
+    return out
+
+
+def export_items_csv(items) -> str:
+    """Haber listesini UTF-8 CSV metnine dönüştürür."""
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["n", "lang", "source", "date", "signal", "impact_score", "title", "link"])
+    for it in items or []:
+        sc = score_item(it.get("title", "")) if "signal" not in it else it
+        writer.writerow([
+            it.get("n", ""),
+            it.get("lang", ""),
+            it.get("source", ""),
+            it.get("date", ""),
+            sc.get("signal", "normal"),
+            sc.get("impact_score", 20),
+            it.get("title", ""),
+            it.get("link", ""),
+        ])
+    return buf.getvalue()
+
+
+def export_items_json(items) -> str:
+    """Haber listesini yapılandırılmış JSON raporuna dönüştürür."""
+    enriched = []
+    for it in items or []:
+        row = dict(it)
+        if "signal" not in row or "impact_score" not in row:
+            row.update(score_item(row.get("title", "")))
+        enriched.append(row)
+    return json.dumps({"count": len(enriched), "items": enriched}, ensure_ascii=False, indent=2)
+
+
 def clean_title(title, source):
     title = re.sub(r"\s+", " ", title or "").strip()
     suffix = f" - {source}"
@@ -170,8 +248,11 @@ async def fetch_rss(q, lang, window="", limit=PER_LANG):
         src = getattr(e, "source", None)
         source = src.get("title", "?") if src else "?"
         pp = getattr(e, "published_parsed", None)
-        out.append({"lang": lang, "q": q, "title": clean_title(e.get("title", ""), source), "source": source,
-                    "date": time.strftime("%d.%m", pp) if pp else "", "ts": calendar.timegm(pp) if pp else 0, "link": e.get("link", "")})
+        title = clean_title(e.get("title", ""), source)
+        sig = score_item(title)
+        out.append({"lang": lang, "q": q, "title": title, "source": source,
+                    "date": time.strftime("%d.%m", pp) if pp else "", "ts": calendar.timegm(pp) if pp else 0,
+                    "link": e.get("link", ""), **sig})
     return out
 
 

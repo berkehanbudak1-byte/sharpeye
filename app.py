@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import core
@@ -32,6 +32,12 @@ limiter = core.RateLimiter(limit=12, window=60)
 class Query(BaseModel):
     query: str = Field(min_length=3, max_length=200)
     window: str = Field(default=core.DEFAULT_WINDOW, max_length=3)
+    keywords: str = Field(default="", max_length=200)
+    signal: str = Field(default="", max_length=20)
+
+
+class ExportRequest(Query):
+    format: str = Field(default="csv", max_length=10)
 
 
 def client_ip(request: Request):
@@ -60,7 +66,21 @@ async def run(coro):
 @app.post("/api/news")  # hızlı: çeviri + haber toplama. Sayfa başlıkları hemen gösterir.
 async def news(body: Query, request: Request):
     guard(request)
-    return {"query": body.query, "items": await run(core.get_news(body.query, win(body)))}
+    items = await run(core.get_news(body.query, win(body)))
+    if body.keywords or body.signal:
+        items = core.filter_items(items, body.keywords, body.signal)
+    return {"query": body.query, "items": items}
+
+
+@app.post("/api/export")  # anlık CSV / JSON istihbarat raporu dışa aktarımı
+async def export_news(body: ExportRequest, request: Request):
+    guard(request)
+    items = await run(core.get_news(body.query, win(body)))
+    if body.keywords or body.signal:
+        items = core.filter_items(items, body.keywords, body.signal)
+    if body.format.lower() == "json":
+        return Response(content=core.export_items_json(items), media_type="application/json; charset=utf-8")
+    return Response(content=core.export_items_csv(items), media_type="text/csv; charset=utf-8")
 
 
 @app.post("/api/analyze")  # yavaş: Claude analizi (haberler önbellekten gelir)
