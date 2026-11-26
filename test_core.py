@@ -455,6 +455,60 @@ class AppTest(unittest.TestCase):
         self.assertEqual(empty_d["sentiment_balance"], "neutral")
         self.assertEqual(empty_d["surges"], [])
 
+    def test_watchlist_alerts_and_api_alerts(self):
+        from fastapi.testclient import TestClient
+        import app as app_mod
+
+        empty_res = core.evaluate_watchlist_alerts([], [])
+        self.assertFalse(empty_res["triggered"])
+        self.assertEqual(empty_res["alerts"], [])
+        self.assertEqual(empty_res["summary"]["triggered_rules"], 0)
+
+        items = [
+            {"n": 1, "lang": "tr", "source": "AA", "title": "Son dakika İstanbul merkezli acil deprem alarmı", "link": "https://a", "bg": False},
+            {"n": 2, "lang": "en", "source": "Reuters", "title": "TCMB holds rates amid inflation tension", "link": "https://b", "bg": False},
+            {"n": 3, "lang": "en", "source": "BBC", "title": "Detail report on AI summit", "link": "https://c", "bg": False},
+            {"n": 4, "lang": "de", "source": "DW", "title": "I\u0307stanbul eski arkeoloji sergisi", "link": "https://d", "bg": True},
+        ]
+        rules = [
+            {"name": "Istanbul Emergency", "entities": ["İstanbul"], "keywords": ["deprem"], "signal": "acil", "min_impact": 60},
+            {"name": "Macro Tension", "entities": ["TCMB"], "signal": "negatif", "min_impact": 25},
+            {"name": "AI Summit", "entities": ["AI"], "keywords": ["summit"]},
+            {"name": "Unmatched High", "entities": ["NATO"], "min_impact": 80},
+        ]
+        res = core.evaluate_watchlist_alerts(items, rules)
+        self.assertTrue(res["triggered"])
+        self.assertEqual(res["summary"]["total_items"], 3)
+        self.assertEqual(res["summary"]["total_rules"], 4)
+        self.assertEqual(res["summary"]["triggered_rules"], 3)
+        self.assertEqual(res["summary"]["matched_items"], 3)
+        self.assertEqual(res["summary"]["critical_alerts"], 1)
+        self.assertEqual(res["alerts"][0]["rule"], "Istanbul Emergency")
+        self.assertEqual(res["alerts"][0]["matches"][0]["matched_entities"], ["İstanbul"])
+
+        no_false_ai = core.evaluate_watchlist_alerts(
+            [{"n": 1, "lang": "en", "source": "X", "title": "More detail said today", "link": "https://x"}],
+            [{"name": "AI Only", "entities": ["AI"]}],
+        )
+        self.assertFalse(no_false_ai["triggered"])
+
+        client = TestClient(app_mod.app)
+        app_mod.limiter.hits.clear()
+        with patch.object(core, "get_news", return_value=items):
+            r_ok = client.post("/api/alerts", json={"query": "deprem", "rules": rules})
+            self.assertEqual(r_ok.status_code, 200)
+            payload = r_ok.json()
+            self.assertEqual(payload["query"], "deprem")
+            self.assertTrue(payload["triggered"])
+            self.assertEqual(payload["summary"]["triggered_rules"], 3)
+
+        r_direct = client.post("/api/alerts", json={"items": items[:2], "rules": ["TCMB"]})
+        self.assertEqual(r_direct.status_code, 200)
+        self.assertTrue(r_direct.json()["triggered"])
+        self.assertEqual(r_direct.json()["alerts"][0]["match_count"], 1)
+
+        self.assertEqual(client.post("/api/alerts", json={"query": "ab", "rules": ["TCMB"]}).status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

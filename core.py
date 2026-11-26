@@ -372,6 +372,165 @@ def build_trend_digest(items) -> dict:
     }
 
 
+def _alert_norm(text: str) -> str:
+    return norm(str(text or "")).replace("\u0307", "")
+
+
+def _parse_rule_terms(val) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        raw = re.split(r"[,;]+", val)
+    elif isinstance(val, (list, tuple, set)):
+        raw = [str(x) for x in val]
+    else:
+        raw = [str(val)]
+    out = []
+    seen = set()
+    for term in raw:
+        cleaned = re.sub(r"\s+", " ", str(term or "")).strip()
+        key = _alert_norm(cleaned)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(cleaned)
+    return out
+
+
+def _term_in_text(term_norm: str, hay_norm: str) -> bool:
+    if not term_norm or not hay_norm:
+        return False
+    if len(term_norm) <= 3 and re.fullmatch(r"[a-z0-9]+", term_norm):
+        return bool(re.search(rf"(?<!\w){re.escape(term_norm)}(?!\w)", hay_norm))
+    return term_norm in hay_norm
+
+
+def evaluate_watchlist_alerts(items, rules) -> dict:
+    """Haber listesini varlık/anahtar kelime, sinyal ve minimum etki puanı kurallarına göre değerlendirip yapılandırılmış alarm bildirimleri döndürür."""
+    active = [dict(it) for it in (items or []) if not it.get("bg")]
+    if not active and items:
+        active = [dict(it) for it in items]
+
+    enriched = []
+    for idx, it in enumerate(active):
+        row = dict(it)
+        if "signal" not in row or "impact_score" not in row or "signals" not in row:
+            row.update(score_item(row.get("title", "")))
+        row["_idx"] = idx
+        row["_hay"] = _alert_norm(f"{row.get('title', '')} {row.get('source', '')} {row.get('summary', '')}")
+        row["_sigs"] = {_alert_norm(s) for s in (row.get("signals") or [row.get("signal", "normal")]) if s}
+        if row.get("signal"):
+            row["_sigs"].add(_alert_norm(str(row["signal"])))
+        enriched.append(row)
+
+    rule_list = [rules] if isinstance(rules, (dict, str)) else list(rules or [])
+    normalized_rules = []
+    for idx, raw_rule in enumerate(rule_list):
+        if isinstance(raw_rule, str):
+            terms = _parse_rule_terms(raw_rule)
+            if not terms:
+                continue
+            normalized_rules.append({
+                "name": terms[0],
+                "entities": terms,
+                "keywords": [],
+                "signals": [],
+                "min_impact": 0,
+                "match_all": False,
+            })
+        elif isinstance(raw_rule, dict):
+            entities = _parse_rule_terms(raw_rule.get("entities") or raw_rule.get("entity"))
+            keywords = _parse_rule_terms(raw_rule.get("keywords") or raw_rule.get("keyword"))
+            sig_terms = _parse_rule_terms(raw_rule.get("signals") or raw_rule.get("signal"))
+            allowed_sigs = [_alert_norm(s) for s in sig_terms if _alert_norm(s) and _alert_norm(s) != "all"]
+            raw_min = raw_rule.get("min_impact", raw_rule.get("min_impact_score", 0))
+            min_impact = max(0, min(100, int(float(raw_min or 0))))
+            name = str(raw_rule.get("name") or raw_rule.get("rule") or raw_rule.get("label") or "").strip()
+            if not name:
+                label_parts = entities[:2] + keywords[:2]
+                name = ", ".join(label_parts) if label_parts else f"rule-{idx + 1}"
+            normalized_rules.append({
+                "name": name,
+                "entities": entities,
+                "keywords": keywords,
+                "signals": allowed_sigs,
+                "min_impact": min_impact,
+                "match_all": bool(raw_rule.get("match_all", False)),
+            })
+
+    alerts = []
+    unique_matched_indices = set()
+    for rule in normalized_rules:
+        matches = []
+        rule_entities_hit = set()
+        rule_keywords_hit = set()
+        rule_signals_hit = set()
+
+        for row in enriched:
+            impact = int(row.get("impact_score", 20))
+            if impact < rule["min_impact"]:
+                continue
+            if rule["signals"] and not (row["_sigs"] & set(rule["signals"])):
+                continue
+
+            matched_ent = [e for e in rule["entities"] if _term_in_text(_alert_norm(e), row["_hay"])]
+            if rule["entities"]:
+                if rule["match_all"] and len(matched_ent) != len(rule["entities"]):
+                    continue
+                if not matched_ent:
+                    continue
+
+            matched_kw = [k for k in rule["keywords"] if _term_in_text(_alert_norm(k), row["_hay"])]
+            if rule["keywords"]:
+                if rule["match_all"] and len(matched_kw) != len(rule["keywords"]):
+                    continue
+                if not matched_kw:
+                    continue
+
+            unique_matched_indices.add(row["_idx"])
+            rule_entities_hit.update(matched_ent)
+            rule_keywords_hit.update(matched_kw)
+            rule_signals_hit.update(s for s in (row.get("signals") or [row.get("signal", "normal")]) if s)
+            matches.append({
+                "n": row.get("n", row["_idx"] + 1),
+                "lang": row.get("lang", ""),
+                "source": row.get("source", ""),
+                "title": row.get("title", ""),
+                "signal": row.get("signal", "normal"),
+                "signals": row.get("signals", ["normal"]),
+                "impact_score": impact,
+                "link": row.get("link", ""),
+                "matched_entities": matched_ent,
+                "matched_keywords": matched_kw,
+            })
+
+        if matches:
+            matches.sort(key=lambda m: (-int(m["impact_score"]), int(m.get("n") or 0)))
+            highest_impact = max(int(m["impact_score"]) for m in matches)
+            alerts.append({
+                "rule": rule["name"],
+                "match_count": len(matches),
+                "highest_impact": highest_impact,
+                "matched_entities": sorted(rule_entities_hit),
+                "matched_keywords": sorted(rule_keywords_hit),
+                "signals": sorted(rule_signals_hit),
+                "matches": matches,
+            })
+
+    alerts.sort(key=lambda a: (-a["highest_impact"], -a["match_count"], a["rule"]))
+    return {
+        "triggered": bool(alerts),
+        "alerts": alerts,
+        "summary": {
+            "total_items": len(enriched),
+            "total_rules": len(normalized_rules),
+            "triggered_rules": len(alerts),
+            "matched_items": len(unique_matched_indices),
+            "highest_impact": max((a["highest_impact"] for a in alerts), default=0),
+            "critical_alerts": sum(1 for a in alerts if a["highest_impact"] >= 65),
+        },
+    }
+
+
 def clean_title(title, source):
     title = re.sub(r"\s+", " ", title or "").strip()
     suffix = f" - {source}"

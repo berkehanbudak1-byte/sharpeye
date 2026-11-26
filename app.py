@@ -40,6 +40,25 @@ class ExportRequest(Query):
     format: str = Field(default="csv", max_length=10)
 
 
+class AlertRule(BaseModel):
+    name: str = Field(default="", max_length=120)
+    entities: list[str] | str = Field(default_factory=list)
+    keywords: list[str] | str = Field(default_factory=list)
+    signal: str = Field(default="", max_length=20)
+    signals: list[str] | str = Field(default_factory=list)
+    min_impact: int = Field(default=0, ge=0, le=100)
+    match_all: bool = False
+
+
+class AlertsRequest(BaseModel):
+    query: str = Field(default="", max_length=200)
+    window: str = Field(default=core.DEFAULT_WINDOW, max_length=3)
+    keywords: str = Field(default="", max_length=200)
+    signal: str = Field(default="", max_length=20)
+    rules: list[AlertRule | str] = Field(default_factory=list, max_length=50)
+    items: list[dict] | None = None
+
+
 def client_ip(request: Request):
     xff = request.headers.get("x-forwarded-for", "")
     if os.getenv("TRUST_PROXY") == "1" and xff:  # Render vb. proxy arkasında
@@ -90,6 +109,21 @@ async def digest_news(body: Query, request: Request):
     if body.keywords or body.signal:
         items = core.filter_items(items, body.keywords, body.signal)
     return {"query": body.query, "digest": core.build_trend_digest(items)}
+
+
+@app.post("/api/alerts")  # izleme listesi ve özel alarm kuralları eşleştiricisi (LLM harcamaz)
+async def alerts_news(body: AlertsRequest, request: Request):
+    guard(request)
+    if body.items is not None and not body.query.strip():
+        items = list(body.items)
+    else:
+        if len(body.query.strip()) < 3:
+            raise HTTPException(422, "Sorgu en az 3 karakter olmalı.")
+        items = await run(core.get_news(body.query, win(body)))
+    if body.keywords or body.signal:
+        items = core.filter_items(items, body.keywords, body.signal)
+    rules = [r.model_dump() if isinstance(r, BaseModel) else r for r in body.rules]
+    return {"query": body.query, **core.evaluate_watchlist_alerts(items, rules)}
 
 
 @app.post("/api/analyze")  # yavaş: Claude analizi (haberler önbellekten gelir)
