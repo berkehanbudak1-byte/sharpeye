@@ -1,8 +1,8 @@
 """Haber toplama ve analiz çekirdeği. FastAPI'den bağımsız, tek başına test edilebilir."""
-import asyncio, calendar, json, logging, os, re, time
+import asyncio, calendar, ipaddress, json, logging, os, re, socket, time
 from collections import OrderedDict, deque
 from html import unescape
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import feedparser
 import httpx
@@ -81,13 +81,16 @@ class RateLimiter:
 
 
 news_memo, analysis_memo = Memo(TTL), Memo(TTL)
-norm = lambda q: re.sub(r"\s+", " ", q.strip().lower())
+norm = lambda q: re.sub(r"\s+", " ", q.strip().replace("İ", "i").lower())
 
 
 async def _gemini(model, system, user, max_tokens):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:  # anahtar yoksa ham KeyError yerine anlaşılır hata (503)
+        raise NewsError("Gemini anahtarı tanımlı değil. GEMINI_API_KEY ortam değişkenini ayarlayıp sunucuyu yeni bir terminalden başlatın.", 503)
     r = await llm_http.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+        headers={"x-goog-api-key": key},
         json={"systemInstruction": {"parts": [{"text": system}]},
               "contents": [{"role": "user", "parts": [{"text": user}]}],
               "generationConfig": {"maxOutputTokens": max_tokens * 2, "responseMimeType": "application/json"}})
@@ -160,7 +163,7 @@ async def fetch_rss(q, lang, window="", limit=PER_LANG):
         r = await http.get(f"https://news.google.com/rss/search?q={quote(q + (' when:' + window if window else ''))}&hl={hl}&gl={gl}&ceid={ceid}")
         r.raise_for_status()
     except Exception as e:
-        log.warning("RSS alınamadı (%s): %s", lang, e)
+        log.warning("RSS alınamadı (%s): %s", lang, type(e).__name__)
         return []
     out = []
     for e in feedparser.parse(r.content).entries[:limit]:
@@ -271,8 +274,8 @@ def normalize(a):
                            "reason": str(conf.get("reason", ""))}}
 
 
-MAX_READ, EXCERPT_CHARS, READ_TIMEOUT = int(os.getenv("MAX_READ", 20)), int(os.getenv("EXCERPT_CHARS", 3000)), 40
-text_http = httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=True, headers={
+MAX_READ, EXCERPT_CHARS, READ_TIMEOUT = int(os.getenv("MAX_READ", "20")), int(os.getenv("EXCERPT_CHARS", "3000")), 40
+text_http = httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=False, headers={
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
     "Accept-Language": "en,tr;q=0.8"})
 
@@ -300,8 +303,8 @@ def _extract(html):
 
 def _og_image(html, base):
     """Sayfanın og:image görselini döndürür. Yalnızca https kabul edilir."""
-    m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og|twitter):image["\'][^>]*>', html[:60000], re.I)
-    v = re.search(r'content=["\']([^"\']+)', m.group(0), re.I) if m else None
+    m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og|twitter):image["\'][^>]*>', html[:60000], re.IGNORECASE)
+    v = re.search(r'content=["\']([^"\']+)', m.group(0), re.IGNORECASE) if m else None
     u = urljoin(base, unescape(v.group(1))) if v else None
     return u if u and u.startswith("https://") else None
 
@@ -324,6 +327,38 @@ def pick_for_reading(items, n=MAX_READ):
     return chosen
 
 
+def _host_public(host):
+    """Ad yalnızca genel IP adreslerine çözülüyorsa True. Döngü (127.x), özel ağ ve bulut metadata adresleri reddedilir."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return bool(infos) and all(ipaddress.ip_address(i[4][0]).is_global for i in infos)
+
+
+async def _safe_get(url):
+    """Yayıncı sayfası: yalnızca https ve genel adres. Yönlendirmeler tek tek denetlenir (en fazla 3). Olmazsa None."""
+    for _ in range(4):
+        p = urlsplit(url)
+        try:
+            port = p.port
+        except ValueError:
+            return None
+        if p.scheme != "https" or not p.hostname or p.username or p.password or port not in (None, 443):
+            return None
+        if not await asyncio.to_thread(_host_public, p.hostname):
+            return None
+        r = await text_http.get(url, follow_redirects=False)
+        if getattr(r, "is_redirect", False) or getattr(r, "status_code", 0) in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location", "")
+            if not loc:
+                return None
+            url = urljoin(url, loc)
+            continue
+        return r
+    return None
+
+
 async def read_one(it, sem):
     """(metin, görsel, sonuç_kodu). Kodlar: ok, decode, fetch, type, short."""
     async with sem:
@@ -331,14 +366,16 @@ async def read_one(it, sem):
             url = await asyncio.to_thread(_decode_sync, it["link"])
             if not url:
                 return None, None, "decode"
-            r = await text_http.get(url)
+            r = await _safe_get(url)
+            if r is None:
+                return None, None, "fetch"
             r.raise_for_status()
-            if "html" not in r.headers.get("content-type", "html"):
+            if "html" not in r.headers.get("content-type", "html").lower():
                 return None, None, "type"
             text = await asyncio.to_thread(_extract, r.text)
             img = _og_image(r.text, str(getattr(r, "url", url)))
         except Exception as e:
-            log.info("metin okunamadı (%s): %r", it["source"], e)
+            log.info("metin okunamadı (%s): %s", it["source"], type(e).__name__)
             return None, None, "fetch"
     if len(text) > 200:
         return text[:EXCERPT_CHARS], img, "ok"
@@ -392,7 +429,7 @@ async def _analyze(query, window=DEFAULT_WINDOW):
     except Exception as e:
         if getattr(getattr(e, "response", None), "status_code", None) == 429:
             raise NewsError("Ücretsiz yapay zekâ kotası doldu. Biraz sonra tekrar dene.", 429)
-        log.warning("analiz hatası: %r", e)
+        log.warning("analiz hatası: %s", type(e).__name__)
         raise NewsError("Analiz üretilemedi. Biraz sonra tekrar dene.", 502)
 
 
@@ -418,7 +455,7 @@ async def fetch_top(lang):
         r = await http.get(f"https://news.google.com/rss?hl={hl}&gl={gl}&ceid={ceid}")
         r.raise_for_status()
     except Exception as e:
-        log.warning("gündem alınamadı (%s): %s", lang, e)
+        log.warning("gündem alınamadı (%s): %s", lang, type(e).__name__)
         return []
     out = []
     for e in feedparser.parse(r.content).entries[:6]:

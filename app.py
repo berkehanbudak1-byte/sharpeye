@@ -11,6 +11,21 @@ import core
 
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in SECURITY_HEADERS.items():
+        response.headers[k] = v
+    return response
+
+
 limiter = core.RateLimiter(limit=12, window=60)
 
 
@@ -22,7 +37,7 @@ class Query(BaseModel):
 def client_ip(request: Request):
     xff = request.headers.get("x-forwarded-for", "")
     if os.getenv("TRUST_PROXY") == "1" and xff:  # Render vb. proxy arkasında
-        return xff.split(",")[0].strip()
+        return xff.split(",")[-1].strip()
     return request.client.host if request.client else "?"
 
 
