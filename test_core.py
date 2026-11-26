@@ -435,10 +435,25 @@ class AppTest(unittest.TestCase):
             self.assertAlmostEqual(dig["critical_alert_ratio"], 0.3333, places=3)
             self.assertEqual(len(dig["top_headlines"]), 3)
             self.assertEqual(dig["top_headlines"][0]["signal"], "acil")
+            self.assertIn("surges", dig)
+
+        surge_items = [
+            {"n": 1, "lang": "tr", "source": "AA", "title": "Son dakika deprem felaketi ve acil kurtarma", "link": "https://aa.com.tr/1"},
+            {"n": 2, "lang": "en", "source": "Reuters", "title": "Breaking deprem emergency response", "link": "https://reuters.com/1"},
+            {"n": 3, "lang": "de", "source": "DW", "title": "Kritik deprem alarmı ve kriz", "link": "https://dw.com/1"},
+        ]
+        surges = core.detect_breaking_surges(surge_items)
+        self.assertGreaterEqual(len(surges), 1)
+        deprem_surge = next(s for s in surges if s["keyword"] == "deprem")
+        self.assertTrue(deprem_surge["confirmed_surge"])
+        self.assertEqual(deprem_surge["source_count"], 3)
+        self.assertGreaterEqual(deprem_surge["avg_impact"], 45.0)
+        self.assertEqual(core.build_trend_digest(surge_items)["surges"][0]["keyword"], "deprem")
 
         empty_d = core.build_trend_digest([])
         self.assertEqual(empty_d["total_items"], 0)
         self.assertEqual(empty_d["sentiment_balance"], "neutral")
+        self.assertEqual(empty_d["surges"], [])
 
 
 if __name__ == "__main__":

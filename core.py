@@ -238,8 +238,62 @@ _DIGEST_STOP = {
 }
 
 
+def detect_breaking_surges(items, min_sources: int = 2, min_avg_impact: float = 35.0) -> list:
+    """Farklı bağımsız kaynakların/alan adlarının aynı varlık veya anahtar kelime kümesini eşzamanlı ve yüksek etki puanıyla haberleştirdiği anlık dalgaları (breaking surge) tespit eder."""
+    active = [dict(it) for it in (items or []) if not it.get("bg")]
+    if not active and items:
+        active = [dict(it) for it in items]
+    if not active:
+        return []
+
+    clusters = {}
+    for it in active:
+        if "signal" not in it or "impact_score" not in it or "signals" not in it:
+            it.update(score_item(it.get("title", "")))
+        src = (it.get("source") or "").strip()
+        if not src or src == "?":
+            host = urlsplit(str(it.get("link") or "")).hostname or ""
+            src = host.lower().removeprefix("www.") or "unknown"
+        lang = (it.get("lang") or "").strip()
+        impact = int(it.get("impact_score", 20))
+        words = {
+            w for w in re.findall(r"[a-zçğıöşü0-9]+", norm(it.get("title", "")))
+            if len(w) >= 3 and w not in _DIGEST_STOP and not w.isdigit()
+        }
+        for w in words:
+            entry = clusters.setdefault(w, {"sources": set(), "langs": set(), "impacts": [], "items": 0})
+            entry["sources"].add(src)
+            if lang:
+                entry["langs"].add(lang)
+            entry["impacts"].append(impact)
+            entry["items"] += 1
+
+    surges = []
+    for kw, data in clusters.items():
+        src_count = len(data["sources"])
+        if src_count < max(2, int(min_sources)):
+            continue
+        impacts = data["impacts"]
+        avg_imp = round(sum(impacts) / len(impacts), 2) if impacts else 0.0
+        max_imp = max(impacts) if impacts else 0
+        confirmed = bool(src_count >= max(2, int(min_sources)) and avg_imp >= float(min_avg_impact))
+        surges.append({
+            "keyword": kw,
+            "confirmed_surge": confirmed,
+            "source_count": src_count,
+            "sources": sorted(data["sources"]),
+            "lang_count": len(data["langs"]),
+            "item_count": data["items"],
+            "avg_impact": avg_imp,
+            "max_impact": max_imp,
+        })
+
+    surges.sort(key=lambda s: (not s["confirmed_surge"], -s["source_count"], -s["avg_impact"], s["keyword"]))
+    return surges[:8]
+
+
 def build_trend_digest(items) -> dict:
-    """Haber listesinden yönetici piyasa ve jeopolitik trend özeti (temalar, duygu dengesi, kritik uyarı oranı, en yüksek etkili 3 başlık) üretir."""
+    """Haber listesinden yönetici piyasa ve jeopolitik trend özeti (temalar, duygu dengesi, kritik uyarı oranı, en yüksek etkili 3 başlık, çok kaynaklı kırılma dalgaları) üretir."""
     from collections import Counter
     active = [dict(it) for it in (items or []) if not it.get("bg")]
     if not active and items:
@@ -254,6 +308,7 @@ def build_trend_digest(items) -> dict:
             "critical_alert_ratio": 0.0,
             "top_themes": [],
             "top_headlines": [],
+            "surges": [],
         }
 
     word_counts = Counter()
@@ -313,6 +368,7 @@ def build_trend_digest(items) -> dict:
         "critical_alert_ratio": round(crit_count / total, 4),
         "top_themes": top_themes,
         "top_headlines": top_headlines,
+        "surges": detect_breaking_surges(active),
     }
 
 
