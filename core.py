@@ -11,9 +11,9 @@ log = logging.getLogger("haber")
 # Sağlayıcı: gemini (ücretsiz kota) | ollama (yerel, tamamen ücretsiz) | anthropic (ücretli)
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-_g, _o = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+_g, _o = os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 MODELS = {"gemini": (_g, _g), "ollama": (_o, _o),  # (ana model, çeviri modeli)
-          "anthropic": (os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5"),
+          "anthropic": (os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
                         os.getenv("TRANSLATE_MODEL", "claude-haiku-4-5-20251001"))}
 llm_http = httpx.AsyncClient(timeout=180.0)  # yerel modeller yavaş olabilir
 http = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0), follow_redirects=True,
