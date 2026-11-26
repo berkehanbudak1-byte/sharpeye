@@ -425,6 +425,21 @@ class AppTest(unittest.TestCase):
             self.assertEqual(r_json.status_code, 200)
             self.assertEqual(r_json.json()["count"], 3)
 
+            r_dig = client.post("/api/digest", json={"query": "deprem"})
+            self.assertEqual(r_dig.status_code, 200)
+            dig = r_dig.json()["digest"]
+            self.assertEqual(dig["total_items"], 3)
+            self.assertEqual(dig["sentiment_balance"], "bullish")
+            self.assertEqual(dig["sentiment_label_tr"], "pozitif")
+            self.assertEqual(dig["critical_alert_count"], 1)
+            self.assertAlmostEqual(dig["critical_alert_ratio"], 0.3333, places=3)
+            self.assertEqual(len(dig["top_headlines"]), 3)
+            self.assertEqual(dig["top_headlines"][0]["signal"], "acil")
+
+        empty_d = core.build_trend_digest([])
+        self.assertEqual(empty_d["total_items"], 0)
+        self.assertEqual(empty_d["sentiment_balance"], "neutral")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

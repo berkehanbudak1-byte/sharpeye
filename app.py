@@ -83,6 +83,15 @@ async def export_news(body: ExportRequest, request: Request):
     return Response(content=core.export_items_csv(items), media_type="text/csv; charset=utf-8")
 
 
+@app.post("/api/digest")  # yönetici piyasa ve jeopolitik trend özeti (LLM harcamaz, anlık sinyal/tema analizi)
+async def digest_news(body: Query, request: Request):
+    guard(request)
+    items = await run(core.get_news(body.query, win(body)))
+    if body.keywords or body.signal:
+        items = core.filter_items(items, body.keywords, body.signal)
+    return {"query": body.query, "digest": core.build_trend_digest(items)}
+
+
 @app.post("/api/analyze")  # yavaş: Claude analizi (haberler önbellekten gelir)
 async def analyze(body: Query, request: Request):
     guard(request)

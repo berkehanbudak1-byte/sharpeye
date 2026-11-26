@@ -229,6 +229,93 @@ def export_items_json(items) -> str:
     return json.dumps({"count": len(enriched), "items": enriched}, ensure_ascii=False, indent=2)
 
 
+_DIGEST_STOP = {
+    "ve", "ile", "için", "bir", "bu", "da", "de", "ama", "ne", "kadar", "gibi", "ise", "olan", "olarak",
+    "daha", "en", "çok", "sonra", "önce", "mi", "mı", "mu", "mü", "ya", "yani",
+    "the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "will", "into", "over", "after",
+    "new", "news", "der", "die", "das", "und", "von", "mit", "les", "des", "une", "dans", "pour", "del", "las", "los",
+    "por", "con", "para", "haber", "son", "dakika", "göre", "üzerine", "hakkında",
+}
+
+
+def build_trend_digest(items) -> dict:
+    """Haber listesinden yönetici piyasa ve jeopolitik trend özeti (temalar, duygu dengesi, kritik uyarı oranı, en yüksek etkili 3 başlık) üretir."""
+    from collections import Counter
+    active = [dict(it) for it in (items or []) if not it.get("bg")]
+    if not active and items:
+        active = [dict(it) for it in items]
+    if not active:
+        return {
+            "total_items": 0,
+            "sentiment_balance": "neutral",
+            "sentiment_label_tr": "notr",
+            "sentiment_counts": {"pozitif": 0, "negatif": 0, "notr": 0},
+            "critical_alert_count": 0,
+            "critical_alert_ratio": 0.0,
+            "top_themes": [],
+            "top_headlines": [],
+        }
+
+    word_counts = Counter()
+    pos_count = 0
+    neg_count = 0
+    neu_count = 0
+    crit_count = 0
+
+    for it in active:
+        if "signal" not in it or "impact_score" not in it or "signals" not in it:
+            it.update(score_item(it.get("title", "")))
+        sigs = set(it.get("signals") or [it.get("signal", "normal")])
+        if "acil" in sigs or "kritik" in sigs:
+            crit_count += 1
+        is_pos = "pozitif" in sigs
+        is_neg = "negatif" in sigs
+        if is_pos and not is_neg:
+            pos_count += 1
+        elif is_neg and not is_pos:
+            neg_count += 1
+        else:
+            neu_count += 1
+
+        words = [w for w in re.findall(r"[a-zçğıöşü0-9]+", norm(it.get("title", ""))) if len(w) >= 3 and w not in _DIGEST_STOP and not w.isdigit()]
+        for w in set(words):
+            word_counts[w] += 1
+
+    total = len(active)
+    if pos_count > neg_count:
+        balance, label_tr = "bullish", "pozitif"
+    elif neg_count > pos_count:
+        balance, label_tr = "bearish", "negatif"
+    else:
+        balance, label_tr = "neutral", "notr"
+
+    top_themes = [{"theme": w, "count": c} for w, c in word_counts.most_common(5)]
+    ranked = sorted(active, key=lambda x: (-int(x.get("impact_score", 20)), int(x.get("n") or 0)))
+    top_headlines = [
+        {
+            "n": it.get("n", i + 1),
+            "lang": it.get("lang", ""),
+            "source": it.get("source", ""),
+            "title": it.get("title", ""),
+            "signal": it.get("signal", "normal"),
+            "impact_score": it.get("impact_score", 20),
+            "link": it.get("link", ""),
+        }
+        for i, it in enumerate(ranked[:3])
+    ]
+
+    return {
+        "total_items": total,
+        "sentiment_balance": balance,
+        "sentiment_label_tr": label_tr,
+        "sentiment_counts": {"pozitif": pos_count, "negatif": neg_count, "notr": neu_count},
+        "critical_alert_count": crit_count,
+        "critical_alert_ratio": round(crit_count / total, 4),
+        "top_themes": top_themes,
+        "top_headlines": top_headlines,
+    }
+
+
 def clean_title(title, source):
     title = re.sub(r"\s+", " ", title or "").strip()
     suffix = f" - {source}"
