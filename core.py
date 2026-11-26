@@ -12,7 +12,8 @@ log = logging.getLogger("haber")
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 _g, _o = os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-MODELS = {"gemini": (_g, _g), "ollama": (_o, _o),  # (ana model, çeviri modeli)
+_k = os.getenv("GROK_MODEL", "grok-3-mini")
+MODELS = {"gemini": (_g, _g), "ollama": (_o, _o), "grok": (_k, _k),  # (ana model, çeviri modeli)
           "anthropic": (os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
                         os.getenv("TRANSLATE_MODEL", "claude-haiku-4-5-20251001"))}
 llm_http = httpx.AsyncClient(timeout=180.0)  # yerel modeller yavaş olabilir
@@ -209,6 +210,26 @@ async def _gemini(model, system, user, max_tokens, step="write"):
     return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
 
 
+async def _grok(model, system, user, max_tokens):
+    key = os.environ.get("GROK_API_KEY", "").strip()
+    if not key:
+        raise NewsError("Grok anahtarı tanımlı değil.", 503)
+    r = await llm_http.post(
+        f"{os.getenv('GROK_BASE_URL', 'https://api.x.ai/v1').rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json=_grok_body(model, system, user, max_tokens))
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _grok_body(model, system, user, max_tokens):
+    body = {"model": model, "max_tokens": max_tokens * 4 if "gpt-oss" in model else max_tokens,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
+    return body
+
+
 async def _ollama(model, system, user, max_tokens):
     r = await llm_http.post(f"{OLLAMA_URL}/api/chat", json={
         "model": model, "stream": False, "format": "json",
@@ -231,13 +252,44 @@ async def _anthropic(model, system, user, max_tokens):
     return "".join(b.text for b in r.content if b.type == "text")
 
 
+RETRY_DELAYS = (0, 3, 8)
+TRANSIENT = {429, 500, 502, 503, 504}
+FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
+
+
+async def _with_retry(call, model, system, user, max_tokens):
+    last = None
+    for delay in RETRY_DELAYS:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await call(model, system, user, max_tokens)
+        except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+                raise
+            last = e
+    raise last
+
+
 async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
-    main, fast = MODELS[PROVIDER]
-    if PROVIDER == "gemini":
+    prov = PROVIDER
+    if prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip() and os.environ.get("GROK_API_KEY", "").strip():
+        prov = "grok"
+    elif prov not in MODELS:
+        prov = "grok" if os.environ.get("GROK_API_KEY", "").strip() else "gemini"
+    main, fast = MODELS[prov]
+    if prov == "gemini":
         step = "fast" if kind == "fast" else "write"
-        return await _gemini(fast if kind == "fast" else main, system, user, max_tokens, step=step)
-    call = {"ollama": _ollama, "anthropic": _anthropic}[PROVIDER]
-    return await call(fast if kind == "fast" else main, system, user, max_tokens)
+        call = lambda m, s, u, mt: _gemini(m, s, u, mt, step=step)
+    else:
+        call = {"grok": _grok, "ollama": _ollama, "anthropic": _anthropic}[prov]
+    model = fast if kind == "fast" else main
+    try:
+        return await _with_retry(call, model, system, user, max_tokens)
+    except Exception as e:
+        if not FALLBACK_MODEL or getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+            raise
+        return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
 
 
 def parse_json(raw):
