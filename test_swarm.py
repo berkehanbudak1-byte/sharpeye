@@ -229,6 +229,53 @@ class TestSharpeyeSwarmOrchestrator(unittest.TestCase):
         )
         self.assertEqual(over_workers.status_code, 422)
 
+    def test_swarm_history_bounded_sanitized_and_exposed_on_api(self):
+        import json
+        from fastapi.testclient import TestClient
+        import app as sharpeye_app
+
+        sw.clear_swarm_history()
+        self.assertEqual(sw.get_swarm_history(), [])
+
+        run_ids = []
+        for idx in range(sw.MAX_HISTORY + 5):
+            order = sw.SwarmWorkOrder(
+                query=f"gizli-sorgu-SECRET-QUERY-{idx}",
+                provider="local",
+                max_workers=1,
+                slices=[
+                    sw.SwarmSlice(
+                        slice_id="s1",
+                        owned_keys=(f"k-{idx}",),
+                        items=[{"title": f"SECRET-ITEM-TITLE-{idx} fiyat 100 TL"}],
+                    )
+                ],
+            )
+            res = sw.run_swarm_orchestration(order)
+            run_ids.append(res["run_id"])
+
+        history = sw.get_swarm_history()
+        self.assertEqual(len(history), sw.MAX_HISTORY)
+        self.assertEqual(history[0]["run_id"], run_ids[-1])
+        self.assertEqual(history[-1]["run_id"], run_ids[5])
+        self.assertEqual(len(sw.get_swarm_history(limit=3)), 3)
+
+        serialized = json.dumps(history)
+        self.assertNotIn("SECRET-QUERY", serialized)
+        self.assertNotIn("SECRET-ITEM-TITLE", serialized)
+
+        with self.assertRaises(sw.SwarmPolicyError):
+            sw.get_swarm_history(limit=-1)
+
+        client = TestClient(sharpeye_app.app)
+        resp = client.get("/api/swarm")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["history_limit"], sw.MAX_HISTORY)
+        self.assertIn("recent_runs", body)
+        self.assertEqual(len(body["recent_runs"]), sw.MAX_HISTORY)
+        self.assertEqual(body["recent_runs"][0]["run_id"], run_ids[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

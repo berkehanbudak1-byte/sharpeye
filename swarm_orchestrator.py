@@ -14,12 +14,16 @@ invariants integrated with ``core.py``:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import os
 import re
+import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
+import uuid
 
 import core
 
@@ -67,8 +71,12 @@ DEFAULT_SLICE_TIMEOUT = 10.0
 MAX_SLICE_TIMEOUT = 30.0
 MAX_QUERY_CHARS = 200
 MAX_ITEM_TEXT_CHARS = 2000
+MAX_HISTORY = 20
+MAX_SWARM_HISTORY = MAX_HISTORY
 
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
+_SWARM_HISTORY_LOCK = threading.Lock()
+_SWARM_HISTORY: deque[dict[str, Any]] = deque(maxlen=MAX_HISTORY)
 
 SWARM_SYSTEM_PROMPT = (
     "Sen salt-okunur bir haber denetim ve doğrulama işçisisin. SADECE JSON döndür.\n"
@@ -397,6 +405,59 @@ def evaluate_one_door_out(
     }
 
 
+def _record_swarm_run(
+    *,
+    provider: str,
+    model: str,
+    max_workers: int,
+    results: Sequence[Mapping[str, Any]],
+    injection_detected: bool,
+    flagged_count: int,
+    one_door_out: Mapping[str, Any],
+    duration_ms: float,
+) -> dict[str, Any]:
+    """Record a bounded, sanitized swarm run summary (no raw query, item text, or secrets)."""
+    total_slices = len(results)
+    succeeded = sum(1 for r in results if r.get("status") == "ok")
+    summary = {
+        "run_id": f"swarm-{uuid.uuid4().hex[:12]}",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "provider": str(provider),
+        "model": str(model),
+        "max_workers": int(max_workers),
+        "total_slices": total_slices,
+        "succeeded_slices": succeeded,
+        "failed_slices": total_slices - succeeded,
+        "total_items": sum(int(r.get("item_count", 0)) for r in results),
+        "injection_detected": bool(injection_detected),
+        "injection_flagged_count": int(flagged_count),
+        "one_door_out_status": str(one_door_out.get("status", "UNKNOWN")),
+        "approval_required": bool(one_door_out.get("approval_required", False)),
+        "reason_count": len(one_door_out.get("reasons") or ()),
+        "duration_ms": round(max(0.0, float(duration_ms)), 2),
+    }
+    with _SWARM_HISTORY_LOCK:
+        _SWARM_HISTORY.append(summary)
+    return dict(summary)
+
+
+def get_swarm_history(limit: int | None = None) -> list[dict[str, Any]]:
+    """Return up to MAX_HISTORY sanitized recent swarm run summaries (newest first)."""
+    with _SWARM_HISTORY_LOCK:
+        items = list(reversed(_SWARM_HISTORY))
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise SwarmPolicyError("history limit negatif olmayan bir tamsayı olmalıdır.")
+        items = items[: min(limit, MAX_HISTORY)]
+    return [dict(entry) for entry in items]
+
+
+def clear_swarm_history() -> None:
+    """Clear the bounded in-memory swarm run history."""
+    with _SWARM_HISTORY_LOCK:
+        _SWARM_HISTORY.clear()
+
+
 def get_swarm_capabilities() -> dict[str, Any]:
     """Return static read-only swarm orchestration capabilities and security policy."""
     return {
@@ -408,6 +469,7 @@ def get_swarm_capabilities() -> dict[str, Any]:
         "max_slices": MAX_SLICES,
         "max_slice_items": MAX_SLICE_ITEMS,
         "max_slice_timeout_seconds": MAX_SLICE_TIMEOUT,
+        "history_limit": MAX_HISTORY,
         "supported_providers": ["auto", "local", "grok", "xai", "gemini"],
         "read_only_tools": sorted(READ_ONLY_TOOLS),
         "forbidden_write_tools": sorted(FORBIDDEN_WRITE_TOOLS),
@@ -431,6 +493,7 @@ def run_swarm_orchestration(
     ask_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a validated SwarmWorkOrder concurrently with bounded threads and timeouts."""
+    run_started = time.monotonic()
     if not isinstance(work_order, SwarmWorkOrder):
         raise SwarmPolicyError("work_order bir SwarmWorkOrder örneği olmalıdır.")
 
@@ -597,13 +660,27 @@ def run_swarm_orchestration(
         query_injection=query_injection,
     )
 
+    total_duration_ms = round((time.monotonic() - run_started) * 1000.0, 2)
+    recorded = _record_swarm_run(
+        provider=provider_info["provider"],
+        model=provider_info["model"],
+        max_workers=effective_workers,
+        results=results,
+        injection_detected=injection_detected,
+        flagged_count=flagged_count,
+        one_door_out=one_door_out,
+        duration_ms=total_duration_ms,
+    )
+
     return {
         "ok": True,
+        "run_id": recorded["run_id"],
         "query": query,
         "provider": provider_info["provider"],
         "model": provider_info["model"],
         "max_workers": effective_workers,
         "slice_timeout_seconds": default_timeout,
+        "duration_ms": total_duration_ms,
         "disjoint_ownership": ownership_map,
         "slices": results,
         "summary": {

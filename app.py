@@ -219,7 +219,10 @@ async def analyze(body: Query, request: Request):
 
 @app.get("/api/swarm")  # salt-okunur swarm politika ve yetenek bildirimi
 async def swarm_capabilities():
-    return swarm_orchestrator.get_swarm_capabilities()
+    return {
+        **swarm_orchestrator.get_swarm_capabilities(),
+        "recent_runs": swarm_orchestrator.get_swarm_history(),
+    }
 
 
 @app.post("/api/swarm")  # paralel salt-okunur çoklu ajan doğrulama ve denetim orkestrasyonu
