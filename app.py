@@ -1,4 +1,5 @@
 """Çalıştır: uvicorn app:app   (önbellek ve istek sınırı süreç içi olduğundan tek worker kullan)"""
+import asyncio
 import base64
 import hashlib
 import os
@@ -12,6 +13,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import core
+import swarm_orchestrator
 
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
@@ -90,6 +92,35 @@ class AlertsRequest(BaseModel):
     signal: str = Field(default="", max_length=20)
     rules: list[AlertRule | str] = Field(default_factory=list, max_length=50)
     items: list[dict] | None = Field(default=None, max_length=200)
+
+
+class SwarmSliceInput(BaseModel):
+    slice_id: str = Field(min_length=1, max_length=64)
+    role: str = Field(default="news_auditor", max_length=64)
+    items: list[dict] = Field(default_factory=list, max_length=swarm_orchestrator.MAX_SLICE_ITEMS)
+    owned_keys: list[str] = Field(default_factory=list, max_length=swarm_orchestrator.MAX_SLICE_ITEMS)
+    requested_tools: list[str] = Field(
+        default_factory=lambda: ["score_signals", "build_digest", "detect_injection"],
+        max_length=16,
+    )
+    requested_actions: list[str] = Field(default_factory=list, max_length=16)
+    timeout_seconds: float | None = Field(default=None, gt=0, le=swarm_orchestrator.MAX_SLICE_TIMEOUT)
+
+
+class SwarmRequest(BaseModel):
+    query: str = Field(min_length=3, max_length=swarm_orchestrator.MAX_QUERY_CHARS)
+    window: str = Field(default=core.DEFAULT_WINDOW, max_length=3)
+    provider: str = Field(default="auto", max_length=20)
+    max_workers: int = Field(default=swarm_orchestrator.DEFAULT_WORKERS, ge=1, le=swarm_orchestrator.MAX_WORKERS)
+    slice_timeout_seconds: float = Field(
+        default=swarm_orchestrator.DEFAULT_SLICE_TIMEOUT,
+        gt=0,
+        le=swarm_orchestrator.MAX_SLICE_TIMEOUT,
+    )
+    slices: list[SwarmSliceInput] | None = Field(default=None, max_length=swarm_orchestrator.MAX_SLICES)
+    items: list[dict] | None = Field(default=None, max_length=100)
+    requested_actions: list[str] = Field(default_factory=list, max_length=16)
+    llm_enabled: bool = False
 
 
 def client_ip(request: Request):
@@ -184,6 +215,55 @@ async def alerts_news(body: AlertsRequest, request: Request):
 async def analyze(body: Query, request: Request):
     guard(request)
     return {"query": body.query, "analysis": await run(core.get_analysis(body.query, win(body)))}
+
+
+@app.get("/api/swarm")  # salt-okunur swarm politika ve yetenek bildirimi
+async def swarm_capabilities():
+    return swarm_orchestrator.get_swarm_capabilities()
+
+
+@app.post("/api/swarm")  # paralel salt-okunur çoklu ajan doğrulama ve denetim orkestrasyonu
+async def run_swarm(body: SwarmRequest, request: Request):
+    guard(request)
+    if body.slices is not None:
+        slices = [
+            swarm_orchestrator.SwarmSlice(
+                slice_id=s.slice_id,
+                role=s.role,
+                items=s.items,
+                owned_keys=tuple(s.owned_keys),
+                requested_tools=tuple(s.requested_tools),
+                requested_actions=tuple(s.requested_actions),
+                timeout_seconds=s.timeout_seconds,
+            )
+            for s in body.slices
+        ]
+    else:
+        if body.items is not None:
+            raw_items = list(body.items)
+        else:
+            w = body.window if body.window in core.WINDOWS else core.DEFAULT_WINDOW
+            raw_items = await run(core.get_news(body.query, w))
+        slices = swarm_orchestrator.partition_items_into_slices(
+            raw_items,
+            num_slices=body.max_workers,
+        )
+
+    order = swarm_orchestrator.SwarmWorkOrder(
+        query=body.query,
+        slices=slices,
+        provider=body.provider,
+        max_workers=body.max_workers,
+        slice_timeout_seconds=body.slice_timeout_seconds,
+        requested_actions=tuple(body.requested_actions),
+        llm_enabled=body.llm_enabled,
+    )
+    try:
+        return await asyncio.to_thread(swarm_orchestrator.run_swarm_orchestration, order)
+    except swarm_orchestrator.SwarmPolicyError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except core.NewsError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
 
 
 @app.get("/healthz")  # Render'ın sağlık kontrolü için
