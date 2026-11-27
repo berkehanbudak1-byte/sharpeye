@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: haber-karsilastir
+    name: sharpeye-news
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -11,7 +11,15 @@ services:
         value: "3.12.8"
       - key: GEMINI_API_KEY
         sync: false        # anahtarı Render panelinden elle gir, dosyaya yazma
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: XAI_API_KEY
+        sync: false        # yedek xAI/Grok anahtarını Render panelinden elle gir
+      - key: XAI_MODEL
+        value: grok-3-mini
       - key: LLM_PROVIDER
         value: gemini
+      - key: ALLOWED_ORIGINS
+        sync: false        # izinli tarayıcı kaynakları (virgülle ayrılmış)
       - key: TRUST_PROXY
         value: "1"
