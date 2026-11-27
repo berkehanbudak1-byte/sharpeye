@@ -93,6 +93,7 @@ async def fake_ask(kind, system, user, max_tokens):
     return Ctl.analysis
 
 
+REAL_ASK = core.ask
 core.ask = fake_ask
 REAL_HOST_PUBLIC = core._host_public
 FAKE_HTTP = Client()
@@ -189,6 +190,40 @@ class T(unittest.IsolatedAsyncioTestCase):
         url, body = Ctl.posts[-1]
         self.assertTrue(url.endswith("/api/chat"))
         self.assertEqual((body["format"], body["stream"]), ("json", False))
+
+    async def test_grok_quota_or_rate_limit_falls_back_to_gemini(self):
+        class FakeHTTPStatusError(Exception):
+            def __init__(self, status_code):
+                super().__init__(f"HTTP {status_code} secret-grok-token-xyz")
+                self.response = types.SimpleNamespace(status_code=status_code)
+
+        for status_code in (402, 429):
+            calls = []
+
+            class FallbackLLMClient:
+                async def post(self, url, headers=None, json=None):
+                    calls.append(url)
+                    if "chat/completions" in url:
+                        def fail():
+                            raise FakeHTTPStatusError(status_code)
+                        return types.SimpleNamespace(raise_for_status=fail, json=lambda: {})
+                    return types.SimpleNamespace(
+                        raise_for_status=lambda: None,
+                        json=lambda: {"candidates": [{"content": {"parts": [{"text": f'{{"ok":{status_code}}}'}]}}]},
+                    )
+
+            with patch.dict(os.environ, {"LLM_PROVIDER": "grok", "GROK_API_KEY": "g-key", "GEMINI_API_KEY": "gem-key"}, clear=False), \
+                 patch.object(core, "PROVIDER", "grok"), \
+                 patch.object(core, "RETRY_DELAYS", (0, 0)), \
+                 patch.object(core, "llm_http", FallbackLLMClient()), \
+                 self.assertLogs(core.log, level="WARNING") as cm:
+                out = await REAL_ASK("main", "sys", "usr", 100)
+            self.assertEqual(out, f'{{"ok":{status_code}}}')
+            self.assertTrue(any("chat/completions" in u for u in calls))
+            self.assertTrue(calls[-1].endswith(":generateContent"))
+            log_output = "\n".join(cm.output)
+            self.assertIn(f"FakeHTTPStatusError {status_code}", log_output)
+            self.assertNotIn("secret-grok-token-xyz", log_output)
 
     async def test_read_articles_partial(self):
         class TH:

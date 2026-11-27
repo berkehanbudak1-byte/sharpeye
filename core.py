@@ -254,7 +254,18 @@ async def _anthropic(model, system, user, max_tokens):
 
 RETRY_DELAYS = (0, 3, 8)
 TRANSIENT = {429, 500, 502, 503, 504}
+QUOTA_OR_TRANSIENT = TRANSIENT | {402}
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
+FALLBACK_PROVIDER = (os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
+
+
+def _provider_call(prov, kind):
+    main, fast = MODELS[prov]
+    model = fast if kind == "fast" else main
+    if prov == "gemini":
+        step = "fast" if kind == "fast" else "write"
+        return (lambda m, s, u, mt: _gemini(m, s, u, mt, step=step)), model
+    return {"grok": _grok, "ollama": _ollama, "anthropic": _anthropic}[prov], model
 
 
 async def _with_retry(call, model, system, user, max_tokens):
@@ -272,24 +283,33 @@ async def _with_retry(call, model, system, user, max_tokens):
 
 
 async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
-    prov = PROVIDER
+    prov = (PROVIDER if PROVIDER != "gemini" else os.getenv("LLM_PROVIDER", PROVIDER)).strip().lower()
     if prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip() and os.environ.get("GROK_API_KEY", "").strip():
         prov = "grok"
     elif prov not in MODELS:
         prov = "grok" if os.environ.get("GROK_API_KEY", "").strip() else "gemini"
-    main, fast = MODELS[prov]
-    if prov == "gemini":
-        step = "fast" if kind == "fast" else "write"
-        call = lambda m, s, u, mt: _gemini(m, s, u, mt, step=step)
-    else:
-        call = {"grok": _grok, "ollama": _ollama, "anthropic": _anthropic}[prov]
-    model = fast if kind == "fast" else main
+    call, model = _provider_call(prov, kind)
     try:
-        return await _with_retry(call, model, system, user, max_tokens)
+        try:
+            return await _with_retry(call, model, system, user, max_tokens)
+        except Exception as e:
+            if not FALLBACK_MODEL or getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+                raise
+            return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
     except Exception as e:
-        if not FALLBACK_MODEL or getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if prov != "grok" or status not in QUOTA_OR_TRANSIENT:
             raise
-        return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
+        fb_prov = (FALLBACK_PROVIDER or os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
+        if not fb_prov and os.environ.get("GEMINI_API_KEY", "").strip():
+            fb_prov = "gemini"
+        if not fb_prov or fb_prov == prov or fb_prov not in MODELS:
+            raise
+        if fb_prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
+            raise
+        log.warning("Grok hatası (%s %s), yedek sağlayıcıya geçiliyor: %s", type(e).__name__, status, fb_prov)
+        fb_call, fb_model = _provider_call(fb_prov, kind)
+        return await _with_retry(fb_call, fb_model, system, user, max_tokens)
 
 
 def parse_json(raw):
