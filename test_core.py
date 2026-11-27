@@ -631,7 +631,7 @@ class SecurityAndGrokHardeningTest(unittest.IsolatedAsyncioTestCase):
                     await core._grok("grok-3-mini", "sys", "usr", 100)
                 self.assertEqual(cm_g.exception.status, 503)
                 with self.assertRaises(core.NewsError) as cm_m:
-                    await core._gemini("gemini-2.5-flash", "sys", "usr", 100)
+                    await core._gemini("gemini-3.8-flash", "sys", "usr", 100)
                 self.assertEqual(cm_m.exception.status, 503)
 
             # Invalid model names rejected (path traversal / injection / spaces)
@@ -942,6 +942,267 @@ class LLMFailoverResilienceTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await REAL_ASK("main", "sys", "usr", 100)
         self.assertEqual(len(non_fb_calls), 1)
+
+    async def test_default_gemini_3_8_flash_and_render_yaml(self):
+        from pathlib import Path
+
+        self.assertEqual(core.MODELS["gemini"][0], os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+        self.assertEqual(core.MODELS["gemini"][1], os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+        if not os.getenv("GEMINI_MODEL"):
+            self.assertEqual(core.MODELS["gemini"], ("gemini-3.8-flash", "gemini-3.8-flash"))
+        self.assertNotIn("gemini-2.5-flash", core.FALLBACK_MODEL)
+
+        render_cfg = (Path(__file__).parent / "render.yaml").read_text(encoding="utf-8")
+        self.assertIn("name: sharpeye-news", render_cfg)
+        self.assertNotIn("name: haber-karsilastir", render_cfg)
+        for expected in (
+            "PYTHON_VERSION",
+            "3.12.8",
+            "GEMINI_MODEL",
+            "gemini-3.8-flash",
+            "XAI_API_KEY",
+            "XAI_MODEL",
+            "grok-3-mini",
+            "ALLOWED_ORIGINS",
+        ):
+            self.assertIn(expected, render_cfg)
+
+    async def test_http_404_triggers_fallback_model_and_secondary_provider_cooldown(self):
+        class Fake404Err(Exception):
+            def __init__(self, msg="retired-model-secret-detail"):
+                super().__init__(msg)
+                self.response = types.SimpleNamespace(status_code=404)
+
+        # 1) HTTP 404 on primary Gemini triggers FALLBACK_MODEL first when configured
+        core._reset_provider_cooldowns()
+        seen_urls = []
+
+        class FallbackModelOn404Client:
+            async def post(self, url, headers=None, json=None):
+                seen_urls.append(url)
+                if "gemini-3.8-flash:generateContent" in url:
+                    raise Fake404Err()
+                if "gemini-3.5-flash-lite:generateContent" in url:
+                    return types.SimpleNamespace(
+                        raise_for_status=lambda: None,
+                        json=lambda: {"candidates": [{"content": {"parts": [{"text": '{"via":"fallback-404"}'}]}}]},
+                    )
+                raise AssertionError(f"unexpected url: {url}")
+
+        with patch.dict(os.environ, {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": "gem-key", "XAI_API_KEY": "xai-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"), \
+             patch.object(core, "MODELS", {**core.MODELS, "gemini": ("gemini-3.8-flash", "gemini-3.8-flash")}), \
+             patch.object(core, "FALLBACK_MODEL", "gemini-3.5-flash-lite"), \
+             patch.object(core, "RETRY_DELAYS", (0,)), \
+             patch.object(core, "llm_http", FallbackModelOn404Client()):
+            out_fb = await REAL_ASK("main", "sys", "usr", 100)
+        self.assertEqual(out_fb, '{"via":"fallback-404"}')
+        self.assertEqual(len(seen_urls), 2)
+        self.assertTrue(seen_urls[0].endswith("gemini-3.8-flash:generateContent"))
+        self.assertTrue(seen_urls[1].endswith("gemini-3.5-flash-lite:generateContent"))
+        self.assertNotIn("gemini", core._PROVIDER_COOLDOWN_UNTIL)
+
+        # 2) HTTP 404 without FALLBACK_MODEL fails over to Grok and cools down Gemini
+        core._reset_provider_cooldowns()
+        failover_urls = []
+
+        class FailoverOn404Client:
+            async def post(self, url, headers=None, json=None):
+                failover_urls.append(url)
+                if url.endswith(":generateContent"):
+                    raise Fake404Err("secret-404-token-xyz")
+                return types.SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"choices": [{"message": {"content": '{"via":"grok-404"}'}}]},
+                )
+
+        with patch.dict(os.environ, {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": "gem-key", "XAI_API_KEY": "xai-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"), \
+             patch.object(core, "FALLBACK_PROVIDER", ""), \
+             patch.object(core, "FALLBACK_MODEL", ""), \
+             patch.object(core, "RETRY_DELAYS", (0,)), \
+             patch.object(core, "llm_http", FailoverOn404Client()), \
+             self.assertLogs(core.log, level="WARNING") as cm:
+            out1 = await REAL_ASK("main", "sys", "usr", 100)
+            self.assertIn("gemini", core._PROVIDER_COOLDOWN_UNTIL)
+            out2 = await REAL_ASK("main", "sys", "usr", 100)
+
+        self.assertEqual(out1, '{"via":"grok-404"}')
+        self.assertEqual(out2, '{"via":"grok-404"}')
+        self.assertEqual(sum(1 for u in failover_urls if u.endswith(":generateContent")), 1)
+        self.assertEqual(sum(1 for u in failover_urls if u.endswith("/chat/completions")), 2)
+        log_text = "\n".join(cm.output)
+        self.assertIn("gemini", log_text)
+        self.assertIn("grok", log_text)
+        self.assertIn("404", log_text)
+        self.assertNotIn("Grok hatası", log_text)
+        self.assertNotIn("secret-404-token-xyz", log_text)
+        core._reset_provider_cooldowns()
+
+    async def test_safe_get_stream_cap_and_redirects(self):
+        consumed = {"big": 0, "cl_big": 0, "ok": 0}
+        exited = []
+
+        class FakeStreamResp:
+            def __init__(self, url, status_code=200, headers=None, chunks=(), key=None):
+                self.url = url
+                self.status_code = status_code
+                self.is_redirect = status_code in (301, 302, 303, 307, 308)
+                self.headers = headers or {}
+                self.encoding = "utf-8"
+                self._chunks = chunks
+                self._key = key
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            async def aiter_bytes(self):
+                for c in self._chunks:
+                    if self._key:
+                        consumed[self._key] += 1
+                    yield c
+
+        class FakeStreamCtx:
+            def __init__(self, resp):
+                self._resp = resp
+
+            async def __aenter__(self):
+                return self._resp
+
+            async def __aexit__(self, exc_type, exc, tb):
+                exited.append(self._resp.url)
+                return False
+
+        class StreamingTH:
+            def stream(self, method, url, follow_redirects=False):
+                assert method == "GET" and follow_redirects is False
+                if url == "https://pub.example/chunked-huge":
+                    return FakeStreamCtx(
+                        FakeStreamResp(url, 200, {"Content-Type": "text/html"}, [b"x" * 100 for _ in range(50)], "big")
+                    )
+                if url == "https://pub.example/cl-huge":
+                    return FakeStreamCtx(
+                        FakeStreamResp(url, 200, {"Content-Length": "999999", "Content-Type": "text/html"}, [b"y" * 10], "cl_big")
+                    )
+                if url == "https://pub.example/chunked-ok":
+                    return FakeStreamCtx(
+                        FakeStreamResp(url, 200, {"Content-Type": "text/html"}, [b"<html>", b"merhaba", b"</html>"], "ok")
+                    )
+                if url == "https://pub.example/redir":
+                    return FakeStreamCtx(
+                        FakeStreamResp(url, 302, {"Location": "https://pub.example/chunked-ok"})
+                    )
+                raise AssertionError(f"unexpected stream url: {url}")
+
+        with patch.object(core, "_host_public", return_value=True), \
+             patch.object(core, "text_http", StreamingTH()), \
+             patch.object(core, "MAX_BODY_BYTES", 250):
+            # Oversized chunked response without Content-Length aborts early without buffering entire stream
+            self.assertIsNone(await core._safe_get("https://pub.example/chunked-huge"))
+            self.assertEqual(consumed["big"], 3)
+
+            # Oversized Content-Length aborts before reading any chunk
+            self.assertIsNone(await core._safe_get("https://pub.example/cl-huge"))
+            self.assertEqual(consumed["cl_big"], 0)
+
+            # Valid chunked response within cap returns decoded text
+            resp_ok = await core._safe_get("https://pub.example/chunked-ok")
+            self.assertIsNotNone(resp_ok)
+            self.assertEqual(resp_ok.text, "<html>merhaba</html>")
+            self.assertEqual(consumed["ok"], 3)
+
+            # Safe redirect via streaming works and closes initial response context
+            resp_redir = await core._safe_get("https://pub.example/redir")
+            self.assertIsNotNone(resp_redir)
+            self.assertEqual(resp_redir.text, "<html>merhaba</html>")
+            self.assertIn("https://pub.example/redir", exited)
+
+    async def test_export_items_csv_formula_injection_neutralization(self):
+        import csv
+        import io
+        from fastapi.testclient import TestClient
+        import app as app_mod
+
+        items = [
+            {"n": 1, "lang": "en", "source": "=cmd|' /C calc'!A0", "date": "12.10", "title": "=HYPERLINK(\"http://evil\")", "link": "https://pub.example/1"},
+            {"n": 2, "lang": "en", "source": "+1+1", "date": "12.10", "title": "-2+3", "link": "@SUM(A1:A2)"},
+            {"n": 3, "lang": "tr", "source": "\t=1+1", "date": "\r=2+2", "title": "   =IMPORTXML(\"http://evil\")", "link": "https://pub.example/3"},
+            {"n": 4, "lang": "tr", "source": "NormalKaynak", "date": "12.10", "title": "Normal haber başlığı", "link": "https://pub.example/4"},
+        ]
+        csv_text = core.export_items_csv(items)
+        rows = list(csv.reader(io.StringIO(csv_text)))
+        self.assertEqual(rows[0], ["n", "lang", "source", "date", "signal", "impact_score", "title", "link"])
+        self.assertTrue(rows[1][2].startswith("'="))
+        self.assertTrue(rows[1][6].startswith("'="))
+        self.assertEqual(rows[2][2], "'+1+1")
+        self.assertEqual(rows[2][6], "'-2+3")
+        self.assertEqual(rows[2][7], "'@SUM(A1:A2)")
+        self.assertTrue(rows[3][2].startswith("'\t="))
+        self.assertTrue(rows[3][3].startswith("'\r="))
+        self.assertTrue(rows[3][6].startswith("'   ="))
+        self.assertEqual(rows[4][2], "NormalKaynak")
+        self.assertEqual(rows[4][6], "Normal haber başlığı")
+
+        client = TestClient(app_mod.app)
+        app_mod.limiter.hits.clear()
+        with patch.object(core, "get_news", return_value=items):
+            r_csv = client.post("/api/export", json={"query": "ekonomi", "format": "csv"})
+            self.assertEqual(r_csv.status_code, 200)
+            api_rows = list(csv.reader(io.StringIO(r_csv.text)))
+            self.assertTrue(api_rows[1][2].startswith("'="))
+            self.assertEqual(api_rows[2][2], "'+1+1")
+            self.assertEqual(api_rows[2][6], "'-2+3")
+            self.assertEqual(api_rows[2][7], "'@SUM(A1:A2)")
+
+    async def test_ollama_url_validation(self):
+        posted = []
+
+        class FakeOllamaLLM:
+            async def post(self, url, headers=None, json=None):
+                posted.append(url)
+                return types.SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"message": {"content": '{"ok":true}'}},
+                )
+
+        # Allowed local / HTTPS Ollama endpoints
+        for good_url in (
+            "http://127.0.0.1:11434",
+            "http://localhost:11434/",
+            "http://[::1]:11434",
+            "https://ollama.example.com:11434",
+        ):
+            with patch.object(core, "OLLAMA_URL", good_url), \
+                 patch.object(core, "llm_http", FakeOllamaLLM()):
+                out = await core._ollama("qwen2.5:7b", "sys", "usr", 100)
+                self.assertEqual(out, '{"ok":true}', good_url)
+                self.assertEqual(posted[-1], good_url.rstrip("/") + "/api/chat")
+
+        # Rejected schemes, credentials, and metadata/obfuscated endpoints
+        for bad_url in (
+            "",
+            "file:///etc/passwd",
+            "ftp://127.0.0.1:11434",
+            "gopher://127.0.0.1:11434",
+            "http://user:pass@127.0.0.1:11434",
+            "http://user@localhost:11434",
+            "http://169.254.169.254",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::ffff:169.254.169.254]",
+            "http://[fd00:ec2::254]",
+            "http://metadata.google.internal",
+            "http://metadata.google.internal.",
+            "http://0.0.0.0:11434",
+            "http://2852039166",
+            "http://0251.0376.0251.0376",
+            "http://127.0.0.1:11434?x=1",
+        ):
+            with patch.object(core, "OLLAMA_URL", bad_url), \
+                 patch.object(core, "llm_http", FakeOllamaLLM()):
+                with self.assertRaises(core.NewsError) as cm:
+                    await core._ollama("qwen2.5:7b", "sys", "usr", 100)
+                self.assertEqual(cm.exception.status, 503, bad_url)
 
 
 if __name__ == "__main__":

@@ -336,7 +336,8 @@ function renderSources(items){
   };
   kwIn.oninput=applyFilter;sigSel.onchange=applyFilter;
   btnCsv.onclick=()=>{
-    const rows=[["n","lang","source","date","signal","impact_score","title","link"],...ITEMS.map(i=>[i.n,i.lang,i.source,i.date||"",i.signal||"normal",i.impact_score||20,`"${String(i.title||"").replace(/"/g,'""')}"`,i.link||""])];
+    const csvSafe=v=>{let s=String(v??"");if(/^[=+\-@\t\r]|^\s+[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'};
+    const rows=[["n","lang","source","date","signal","impact_score","title","link"],...ITEMS.map(i=>[i.n,i.lang,i.source,i.date||"",i.signal||"normal",i.impact_score||20,i.title||"",i.link||""].map(csvSafe))];
     downloadBlob(rows.map(r=>r.join(",")).join("\n"),"istihbarat-raporu.csv","text/csv;charset=utf-8");
   };
   btnJson.onclick=()=>downloadBlob(JSON.stringify({count:ITEMS.length,items:ITEMS},null,2),"istihbarat-raporu.json","application/json;charset=utf-8");

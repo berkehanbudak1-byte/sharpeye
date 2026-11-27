@@ -10,7 +10,8 @@ import httpx
 log = logging.getLogger("haber")
 # Sağlayıcı: gemini (ücretsiz kota) | grok / xai (xAI) | ollama (yerel) | anthropic (ücretli)
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+_DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_URL = os.getenv("OLLAMA_URL", _DEFAULT_OLLAMA_URL)
 _g, _o = os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 _k = os.getenv("XAI_MODEL") or os.getenv("GROK_MODEL") or "grok-3-mini"
 MODELS = {"gemini": (_g, _g), "ollama": (_o, _o), "grok": (_k, _k),  # (ana model, çeviri modeli)
@@ -338,9 +339,76 @@ def _grok_body(model, system, user, max_tokens):
     return body
 
 
+_OLLAMA_BLOCKED_HOSTS = {
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "instance-data",
+    "metadata.aws.internal",
+    "metadata.azure.internal",
+}
+_OLLAMA_BLOCKED_IPS = {
+    ipaddress.ip_address("169.254.169.254"),
+    ipaddress.ip_address("169.254.170.2"),
+    ipaddress.ip_address("100.100.100.200"),
+    ipaddress.ip_address("fd00:ec2::254"),
+}
+
+
+def _is_ollama_blocked_host(host):
+    """Ollama yerel/LAN adreslerine izin verirken bulut metadata ve geçersiz hedefleri engeller."""
+    h = str(host or "").strip().rstrip(".").lower()
+    if not h or any(ord(c) < 32 or c.isspace() for c in h):
+        return True
+    if h in _OLLAMA_BLOCKED_HOSTS or h.endswith(".metadata.google.internal") or h.endswith(".metadata.goog"):
+        return True
+    if all(re.fullmatch(r"(?:0x[0-9a-f]+|\d+)", part) for part in h.split(".")):
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            return True
+    else:
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            return False
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
+    if ip in _OLLAMA_BLOCKED_IPS:
+        return True
+    if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return True
+    return False
+
+
+def _ollama_endpoint():
+    """OLLAMA_URL değerini doğrular; http(s) dışı şemaları, gömülü kimlik bilgilerini ve metadata adreslerini reddeder."""
+    raw = OLLAMA_URL if OLLAMA_URL != _DEFAULT_OLLAMA_URL else os.getenv("OLLAMA_URL", OLLAMA_URL)
+    base = str(raw or "").strip().rstrip("/")
+    if not base or "\\" in base or any(ord(c) < 32 or c.isspace() for c in base):
+        raise NewsError("Geçersiz Ollama API adresi.", 503)
+    p = urlsplit(base)
+    try:
+        _ = p.port
+    except ValueError:
+        raise NewsError("Geçersiz Ollama API adresi.", 503)
+    if (
+        p.scheme.lower() not in ("http", "https")
+        or not p.hostname
+        or p.username
+        or p.password
+        or "@" in p.netloc
+        or p.query
+        or p.fragment
+        or _is_ollama_blocked_host(p.hostname)
+    ):
+        raise NewsError("Geçersiz Ollama API adresi.", 503)
+    return f"{base}/api/chat"
+
+
 async def _ollama(model, system, user, max_tokens):
     model = validate_model_name(model)
-    r = await llm_http.post(f"{OLLAMA_URL}/api/chat", json={
+    r = await llm_http.post(_ollama_endpoint(), json={
         "model": model, "stream": False, "format": "json",
         "options": {"num_predict": max_tokens, "num_ctx": 8192},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
@@ -365,9 +433,10 @@ async def _anthropic(model, system, user, max_tokens):
 RETRY_DELAYS = (0, 3, 8)
 TRANSIENT = {429, 500, 502, 503, 504}
 QUOTA_CODES = {402, 429}
+COOLDOWN_CODES = QUOTA_CODES | {404}
 QUOTA_OR_TRANSIENT = TRANSIENT | QUOTA_CODES
 FAILOVER_STATUSES = {401, 402, 403, 404, 429, 500, 502, 503, 504}
-FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
+FALLBACK_MODEL = (os.getenv("LLM_FALLBACK_MODEL") or os.getenv("GEMINI_FALLBACK_MODEL") or "").strip()
 FALLBACK_PROVIDER = (os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
 LLM_COOLDOWN_SECS = int(os.getenv("LLM_COOLDOWN_SECS", "300"))
 _PROVIDER_COOLDOWN_UNTIL = {}
@@ -475,12 +544,13 @@ async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
         try:
             return await _with_retry(call, model, system, user, max_tokens)
         except Exception as e:
-            if not FALLBACK_MODEL or not _is_transient_err(e):
+            err_status = getattr(getattr(e, "response", None), "status_code", None)
+            if not FALLBACK_MODEL or FALLBACK_MODEL == model or not (_is_transient_err(e) or err_status == 404):
                 raise
             return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
-        if status in QUOTA_CODES:
+        if status in COOLDOWN_CODES:
             cooldown_secs = int(os.getenv("LLM_COOLDOWN_SECS", str(LLM_COOLDOWN_SECS)) or LLM_COOLDOWN_SECS)
             if cooldown_secs > 0:
                 _PROVIDER_COOLDOWN_UNTIL[prov] = time.monotonic() + cooldown_secs
@@ -490,7 +560,7 @@ async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
             secondary = _secondary_provider(prov)
         if not secondary:
             raise
-        if isinstance(status, int):
+        if isinstance(status, int) and not isinstance(status, bool):
             log.warning("LLM sağlayıcı hatası (%s -> %s): %s %s", prov, secondary, type(e).__name__, status)
         else:
             log.warning("LLM sağlayıcı hatası (%s -> %s): %s", prov, secondary, type(e).__name__)
@@ -570,6 +640,19 @@ def filter_items(items, keywords="", signal=""):
     return out
 
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(val):
+    """Excel/Calc CSV formül enjeksiyonunu (spreadsheet injection) etkisizleştirir."""
+    if val is None or (isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0):
+        return val
+    s = str(val)
+    if s and (s[0] in _CSV_FORMULA_PREFIXES or s.lstrip()[0:1] in _CSV_FORMULA_PREFIXES):
+        return "'" + s
+    return s
+
+
 def export_items_csv(items) -> str:
     """Haber listesini UTF-8 CSV metnine dönüştürür."""
     import csv
@@ -580,14 +663,14 @@ def export_items_csv(items) -> str:
     for it in items or []:
         sc = score_item(it.get("title", "")) if "signal" not in it else it
         writer.writerow([
-            it.get("n", ""),
-            it.get("lang", ""),
-            it.get("source", ""),
-            it.get("date", ""),
-            sc.get("signal", "normal"),
-            sc.get("impact_score", 20),
-            it.get("title", ""),
-            it.get("link", ""),
+            _csv_safe(it.get("n", "")),
+            _csv_safe(it.get("lang", "")),
+            _csv_safe(it.get("source", "")),
+            _csv_safe(it.get("date", "")),
+            _csv_safe(sc.get("signal", "normal")),
+            _csv_safe(sc.get("impact_score", 20)),
+            _csv_safe(it.get("title", "")),
+            _csv_safe(it.get("link", "")),
         ])
     return buf.getvalue()
 
@@ -1108,8 +1191,44 @@ def _host_public(host):
     return bool(infos) and all(_is_public_ip(i[4][0]) for i in infos)
 
 
+class _SafeResponse:
+    """Akıştan en fazla MAX_BODY_BYTES okunarak oluşturulmuş hafif HTTP yanıt sarmalayıcısı."""
+    def __init__(self, resp, content: bytes, url: str):
+        self._resp = resp
+        self.status_code = getattr(resp, "status_code", 200)
+        self.headers = getattr(resp, "headers", {})
+        self.url = getattr(resp, "url", url) or url
+        self.is_redirect = getattr(resp, "is_redirect", False)
+        self.content = content
+        enc = getattr(resp, "encoding", None) or "utf-8"
+        try:
+            self.text = content.decode(enc, errors="replace")
+        except LookupError:
+            self.text = content.decode("utf-8", errors="replace")
+
+    def raise_for_status(self):
+        fn = getattr(self._resp, "raise_for_status", None)
+        if callable(fn):
+            fn()
+
+
+def _header_get(headers, name, default=None):
+    if not headers:
+        return default
+    if hasattr(headers, "get"):
+        val = headers.get(name)
+        if val is not None:
+            return val
+    target = name.lower()
+    if hasattr(headers, "items"):
+        for k, v in headers.items():
+            if str(k).lower() == target:
+                return v
+    return default
+
+
 async def _safe_get(url):
-    """Yayıncı sayfası: yalnızca https, standart 443, kimliksiz URL ve genel adres. Yönlendirmeler tek tek denetlenir (en fazla 3). Olmazsa None."""
+    """Yayıncı sayfası: yalnızca https, standart 443, kimliksiz URL ve genel adres. Yönlendirmeler tek tek denetlenir (en fazla 3); gövde akışla MAX_BODY_BYTES ile sınırlanır. Olmazsa None."""
     for _ in range(4):
         if not isinstance(url, str) or not url or "\\" in url or any(ord(c) < 32 or c.isspace() for c in url):
             return None
@@ -1122,15 +1241,42 @@ async def _safe_get(url):
             return None
         if not await asyncio.to_thread(_host_public, p.hostname):
             return None
+        if hasattr(text_http, "stream"):
+            async with text_http.stream("GET", url, follow_redirects=False) as r:
+                if getattr(r, "is_redirect", False) or getattr(r, "status_code", 0) in (301, 302, 303, 307, 308):
+                    loc = _header_get(getattr(r, "headers", None), "location", "")
+                    if not loc:
+                        return None
+                    url = urljoin(url, loc)
+                    continue
+                cl = _header_get(getattr(r, "headers", None), "content-length")
+                if cl is not None and str(cl).strip().isdigit() and int(str(cl).strip()) > MAX_BODY_BYTES:
+                    return None
+                if getattr(r, "status_code", 200) >= 400:
+                    return _SafeResponse(r, b"", url)
+                chunks, total = [], 0
+                async for chunk in r.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_BODY_BYTES:
+                        return None
+                    chunks.append(chunk)
+                return _SafeResponse(r, b"".join(chunks), url)
         r = await text_http.get(url, follow_redirects=False)
         if getattr(r, "is_redirect", False) or getattr(r, "status_code", 0) in (301, 302, 303, 307, 308):
-            loc = r.headers.get("location", "")
+            loc = _header_get(getattr(r, "headers", None), "location", "")
             if not loc:
                 return None
             url = urljoin(url, loc)
             continue
-        cl = r.headers.get("content-length") if hasattr(getattr(r, "headers", None), "get") else None
+        cl = _header_get(getattr(r, "headers", None), "content-length")
         if cl is not None and str(cl).strip().isdigit() and int(str(cl).strip()) > MAX_BODY_BYTES:
+            return None
+        raw = getattr(r, "content", None)
+        if isinstance(raw, (bytes, bytearray)) and len(raw) > MAX_BODY_BYTES:
+            return None
+        if raw is None and isinstance(getattr(r, "text", None), str) and len(r.text.encode("utf-8")) > MAX_BODY_BYTES:
             return None
         return r
     return None
@@ -1147,7 +1293,7 @@ async def read_one(it, sem):
             if r is None:
                 return None, None, "fetch"
             r.raise_for_status()
-            if "html" not in r.headers.get("content-type", "html").lower():
+            if "html" not in str(_header_get(getattr(r, "headers", None), "content-type", "html")).lower():
                 return None, None, "type"
             if is_antibot_page(r.text):
                 return None, None, "antibot"
