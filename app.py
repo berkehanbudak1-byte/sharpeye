@@ -1,9 +1,14 @@
 """Çalıştır: uvicorn app:app   (önbellek ve istek sınırı süreç içi olduğundan tek worker kullan)"""
 import asyncio
 import base64
+from collections import OrderedDict, deque
 import hashlib
+import hmac
+import math
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,6 +18,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import core
+import dpapi_vault
 import swarm_orchestrator
 
 app = FastAPI()
@@ -61,7 +67,116 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+class AuthFailureRateLimiter:
+    """Bounded sliding-window per-IP rate limiter for failed API-key attempts."""
+
+    def __init__(
+        self,
+        max_failures: int = 5,
+        window_seconds: float = 60.0,
+        max_tracked_ips: int = 4096,
+        clock=time.monotonic,
+    ):
+        if max_failures < 1:
+            raise ValueError("max_failures must be >= 1")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be > 0")
+        if max_tracked_ips < 1:
+            raise ValueError("max_tracked_ips must be >= 1")
+        self.max_failures = int(max_failures)
+        self.window_seconds = float(window_seconds)
+        self.max_tracked_ips = int(max_tracked_ips)
+        self.clock = clock
+        self._failures: OrderedDict[str, deque[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _normalize_ip(ip: str) -> str:
+        cleaned = str(ip or "").strip()[:128]
+        return cleaned or "?"
+
+    def _prune_bucket(self, bucket: deque[float], now: float) -> None:
+        cutoff = now - self.window_seconds
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+    def _evict_if_needed(self, now: float) -> None:
+        if len(self._failures) < self.max_tracked_ips:
+            return
+        cutoff = now - self.window_seconds
+        expired = [k for k, q in self._failures.items() if not q or q[-1] <= cutoff]
+        for k in expired:
+            self._failures.pop(k, None)
+        while len(self._failures) >= self.max_tracked_ips:
+            self._failures.popitem(last=False)
+
+    def check_allowed(self, ip: str) -> tuple[bool, int]:
+        """Return `(allowed, retry_after_seconds)` for an authentication attempt."""
+        key = self._normalize_ip(ip)
+        now = float(self.clock())
+        with self._lock:
+            bucket = self._failures.get(key)
+            if bucket is None:
+                return True, 0
+            self._prune_bucket(bucket, now)
+            if not bucket:
+                self._failures.pop(key, None)
+                return True, 0
+            if len(bucket) >= self.max_failures:
+                retry_after = max(1, int(math.ceil(self.window_seconds - (now - bucket[0]))))
+                return False, retry_after
+            return True, 0
+
+    def is_blocked(self, ip: str) -> bool:
+        allowed, _ = self.check_allowed(ip)
+        return not allowed
+
+    def retry_after(self, ip: str) -> int:
+        allowed, retry = self.check_allowed(ip)
+        return 0 if allowed else retry
+
+    def record_failure(self, ip: str) -> int:
+        """Record a failed auth attempt for `ip` and return active window failure count."""
+        key = self._normalize_ip(ip)
+        now = float(self.clock())
+        with self._lock:
+            bucket = self._failures.get(key)
+            if bucket is not None:
+                self._prune_bucket(bucket, now)
+                self._failures.move_to_end(key)
+            else:
+                self._evict_if_needed(now)
+                bucket = deque(maxlen=self.max_failures)
+                self._failures[key] = bucket
+            bucket.append(now)
+            return len(bucket)
+
+    def record_success(self, ip: str) -> None:
+        """Clear tracked failure history for `ip` after a successful authentication."""
+        key = self._normalize_ip(ip)
+        with self._lock:
+            self._failures.pop(key, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._failures)
+
+
 limiter = core.RateLimiter(limit=12, window=60)
+auth_failure_limiter = AuthFailureRateLimiter(max_failures=5, window_seconds=60.0, max_tracked_ips=4096)
+
+_DPAPI_SECRET_ENV_NAMES = (
+    "SHARPEYE_API_KEY",
+    "GEMINI_API_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+)
 
 
 class Query(BaseModel):
@@ -134,6 +249,70 @@ def win(body: Query):
     return body.window if body.window in core.WINDOWS else core.DEFAULT_WINDOW
 
 
+def unseal_dpapi_env_secrets(env_names=_DPAPI_SECRET_ENV_NAMES, env=None, runner=None) -> int:
+    """Unseal any `dpapi:v1:` secrets in `env` in-place; returns count unsealed."""
+    target = os.environ if env is None else env
+    unsealed_count = 0
+    for name in env_names:
+        raw = (target.get(name) or "").strip()
+        if dpapi_vault.is_dpapi_secret(raw):
+            target[name] = dpapi_vault.unseal_secret(raw, runner=runner)
+            unsealed_count += 1
+    return unsealed_count
+
+
+def get_configured_api_key(env=None, runner=None) -> str:
+    """Return optional SHARPEYE_API_KEY (unsealing `dpapi:v1:` if sealed), or '' when disabled."""
+    return dpapi_vault.load_secret("SHARPEYE_API_KEY", default="", env=env, runner=runner)
+
+
+def _extract_api_key(request: Request) -> str:
+    """Read API key strictly from HTTP headers (`Authorization: Bearer` or `X-API-Key`)."""
+    auth_header = (request.headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+    return (request.headers.get("x-api-key") or "").strip()
+
+
+def verify_api_key(request: Request):
+    """Constant-time optional API-key check with per-IP 429 auth failure limiting.
+
+    Disabled when `SHARPEYE_API_KEY` is unset so default public behavior stays backward-compatible.
+    """
+    raw_env = (os.environ.get("SHARPEYE_API_KEY") or "").strip()
+    if not raw_env:
+        return
+
+    ip = client_ip(request)
+    allowed, retry_after = auth_failure_limiter.check_allowed(ip)
+    if not allowed:
+        raise HTTPException(
+            429,
+            "Çok fazla başarısız kimlik doğrulama denemesi. Lütfen daha sonra tekrar deneyin.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    try:
+        expected = get_configured_api_key()
+    except (dpapi_vault.DPAPIError, ValueError):
+        raise HTTPException(503, "API anahtarı yapılandırması geçersiz.") from None
+    if not expected:
+        return
+
+    provided = _extract_api_key(request)
+    if not provided or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        auth_failure_limiter.record_failure(ip)
+        raise HTTPException(
+            401,
+            "Geçersiz veya eksik API anahtarı.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    auth_failure_limiter.record_success(ip)
+
+
 def verify_origin(request: Request):
     """Tarayıcı kaynaklı POST/PUT/PATCH/DELETE isteklerinde Origin başlığını doğrular."""
     if getattr(request, "method", "GET").upper() not in ("POST", "PUT", "PATCH", "DELETE"):
@@ -153,6 +332,7 @@ def verify_origin(request: Request):
 
 def guard(request: Request):
     verify_origin(request)
+    verify_api_key(request)
     if not limiter.allow(client_ip(request)):
         raise HTTPException(429, "Çok fazla istek. Bir dakika sonra tekrar dene.")
 
