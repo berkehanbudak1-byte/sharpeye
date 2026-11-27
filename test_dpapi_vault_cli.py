@@ -626,6 +626,162 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
             self.assertIn("invalid", err_k.getvalue().lower())
             self.assertNotIn("/home/alice", err_k.getvalue())
 
+    def test_cli_argument_errors_return_code_2_and_sanitize_paths_and_secrets(self) -> None:
+        repo_root = str(Path(__file__).resolve().parent)
+        user_home = str(Path.home())
+
+        # Root parser and both subparsers must use _SafeArgumentParser
+        parser = dpapi_vault_cli.build_parser()
+        self.assertIsInstance(parser, dpapi_vault_cli._SafeArgumentParser)
+        subparsers_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, dpapi_vault_cli.argparse._SubParsersAction)
+        )
+        self.assertEqual(set(subparsers_action.choices.keys()), {"status", "seal"})
+        for subparser in subparsers_action.choices.values():
+            self.assertIsInstance(subparser, dpapi_vault_cli._SafeArgumentParser)
+
+        # Missing subcommand
+        out0, err0 = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out0), contextlib.redirect_stderr(err0):
+            rc0 = dpapi_vault_cli.main([])
+        self.assertEqual(rc0, 2)
+        self.assertEqual(out0.getvalue(), "")
+        self.assertNotIn("Traceback", err0.getvalue())
+
+        # Invalid subcommands (plain, POSIX path, API key)
+        for bad_cmd, expected_placeholder, forbidden_parts in (
+            ("rotate", None, ()),
+            ("/home/testuser/bad-cmd", "[PATH]", ("/home/testuser", "bad-cmd")),
+            ("sk-leaktoken1234567890", "[REDACTED_KEY]", ("sk-leaktoken1234567890",)),
+        ):
+            out_cmd, err_cmd = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_cmd), contextlib.redirect_stderr(err_cmd):
+                rc_cmd = dpapi_vault_cli.main([bad_cmd])
+            self.assertEqual(rc_cmd, 2)
+            self.assertEqual(out_cmd.getvalue(), "")
+            stderr_cmd = err_cmd.getvalue()
+            self.assertNotIn("Traceback", stderr_cmd)
+            self.assertNotIn(user_home, stderr_cmd)
+            self.assertNotIn(repo_root, stderr_cmd)
+            for forbidden in forbidden_parts:
+                self.assertNotIn(forbidden, stderr_cmd)
+            if expected_placeholder is not None:
+                self.assertIn(expected_placeholder, stderr_cmd)
+
+        # Unrecognized args on status carrying paths, provider keys, Bearer token, URL creds, and DPAPI token
+        out_status, err_status = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_status), contextlib.redirect_stderr(err_status):
+            rc_status = dpapi_vault_cli.main(
+                [
+                    "status",
+                    "--unknown-arg",
+                    "/home/testuser/private/.env",
+                    r"C:\Users\TestUser\private\.env",
+                    r"\\fileserver\share\.env",
+                    "sk-leaktoken1234567890",
+                    "sk-ant-api03-leaksecret1234",
+                    "xai-leaksecret123456",
+                    "gsk_leaksecret123456",
+                    "AIzaSyLeakSecret1234567890",
+                    "Bearer secretToken999",
+                    "https://user:superpass@example.com/a?api_key=secret123&x=1",
+                    "dpapi:v1:c2VjcmV0Y2lwaGVy",
+                ]
+            )
+        self.assertEqual(rc_status, 2)
+        self.assertEqual(out_status.getvalue(), "")
+        stderr_status = err_status.getvalue()
+        for forbidden in (
+            "/home/testuser",
+            r"C:\Users\TestUser",
+            r"\\fileserver",
+            "fileserver",
+            "private/.env",
+            "sk-leaktoken1234567890",
+            "sk-ant-api03-leaksecret1234",
+            "xai-leaksecret123456",
+            "gsk_leaksecret123456",
+            "AIzaSyLeakSecret1234567890",
+            "secretToken999",
+            "superpass",
+            "secret123",
+            "c2VjcmV0Y2lwaGVy",
+            "Traceback",
+            user_home,
+            repo_root,
+        ):
+            self.assertNotIn(forbidden, stderr_status)
+            self.assertNotIn(forbidden, out_status.getvalue())
+        for placeholder in ("[PATH]", "[REDACTED_KEY]", "[REDACTED]", "dpapi:v1:[REDACTED]"):
+            self.assertIn(placeholder, stderr_status)
+
+        # Direct check that URL credentials and sensitive query params are masked by _redact_sensitive_text
+        redacted_url = dpapi_vault_cli._redact_sensitive_text(
+            "https://user:superpass@example.com/a?api_key=secret123&x=1"
+        )
+        self.assertEqual(redacted_url, "https://***@example.com/a?api_key=***&x=1")
+
+        # Invalid --scope on seal exercises p_seal._SafeArgumentParser.error()
+        for bad_scope, expected_placeholder, forbidden_parts in (
+            ("InvalidScope", None, ()),
+            ("AIzaSyLeakSecret1234567890", "[REDACTED_KEY]", ("AIzaSyLeakSecret1234567890",)),
+            ("xai-leaksecret123456", "[REDACTED_KEY]", ("xai-leaksecret123456",)),
+            ("/home/testuser/bad", "[PATH]", ("/home/testuser", "/bad")),
+            (r"C:\Users\TestUser\bad", "[PATH]", (r"C:\Users\TestUser", r"\bad")),
+        ):
+            out_scope, err_scope = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_scope), contextlib.redirect_stderr(err_scope):
+                rc_scope = dpapi_vault_cli.main(["seal", "--scope", bad_scope])
+            self.assertEqual(rc_scope, 2)
+            self.assertEqual(out_scope.getvalue(), "")
+            stderr_scope = err_scope.getvalue()
+            self.assertNotIn("Traceback", stderr_scope)
+            self.assertNotIn(user_home, stderr_scope)
+            self.assertNotIn(repo_root, stderr_scope)
+            for forbidden in forbidden_parts:
+                self.assertNotIn(forbidden, stderr_scope)
+            if expected_placeholder is not None:
+                self.assertIn(expected_placeholder, stderr_scope)
+
+        # Help flags return 0 with fixed prog and without local/repo paths
+        for help_argv in (["--help"], ["status", "--help"], ["seal", "--help"]):
+            out_help, err_help = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_help), contextlib.redirect_stderr(err_help):
+                rc_help = dpapi_vault_cli.main(help_argv)
+            self.assertEqual(rc_help, 0)
+            self.assertEqual(err_help.getvalue(), "")
+            self.assertIn("dpapi_vault_cli.py", out_help.getvalue())
+            self.assertNotIn(user_home, out_help.getvalue())
+            self.assertNotIn(repo_root, out_help.getvalue())
+
+        # VaultCLIError with embedded synthetic path, API key, and DPAPI token is sanitized in main()
+        out_v, err_v = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            dpapi_vault_cli,
+            "collect_vault_status",
+            side_effect=dpapi_vault_cli.VaultCLIError(
+                r"failed reading /home/testuser/private/.env and C:\Users\TestUser\private\.env "
+                "with sk-leaktoken1234567890 and dpapi:v1:c2VjcmV0Y2lwaGVy"
+            ),
+        ):
+            with contextlib.redirect_stdout(out_v), contextlib.redirect_stderr(err_v):
+                rc_v = dpapi_vault_cli.main(["status"])
+        self.assertEqual(rc_v, 1)
+        self.assertEqual(out_v.getvalue(), "")
+        stderr_v = err_v.getvalue()
+        for forbidden in (
+            "/home/testuser",
+            r"C:\Users\TestUser",
+            "sk-leaktoken1234567890",
+            "c2VjcmV0Y2lwaGVy",
+            "Traceback",
+        ):
+            self.assertNotIn(forbidden, stderr_v)
+        for placeholder in ("[PATH]", "[REDACTED_KEY]", "dpapi:v1:[REDACTED]"):
+            self.assertIn(placeholder, stderr_v)
+
     def test_standalone_subprocess_cli_zero_deps_and_zero_leaks(self) -> None:
         repo_root = Path(__file__).resolve().parent
         cli_script = repo_root / "dpapi_vault_cli.py"
@@ -638,15 +794,13 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
             env_path.write_bytes(original_bytes)
 
             child_env = {
-                k: v
-                for k, v in os.environ.items()
-                if not dpapi_vault_cli.is_sensitive_key(k)
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONDONTWRITEBYTECODE": "1",
             }
-            child_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-            # 1. status --json
+            # 1. status --json in isolated stdlib-only mode (-I -S -B)
             proc_status = subprocess.run(
-                [sys.executable, "-B", str(cli_script), "status", "--env-file", str(env_path), "--json"],
+                [sys.executable, "-I", "-S", "-B", str(cli_script), "status", "--env-file", str(env_path), "--json"],
                 capture_output=True,
                 text=True,
                 env=child_env,
@@ -662,9 +816,20 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
                 self.assertNotIn(forbidden, proc_status.stdout)
                 self.assertNotIn(forbidden, proc_status.stderr)
 
-            # 2. seal --dry-run --json
+            # 2. seal --dry-run --json in isolated stdlib-only mode (-I -S -B)
             proc_dry = subprocess.run(
-                [sys.executable, "-B", str(cli_script), "seal", "--env-file", str(env_path), "--dry-run", "--json"],
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(cli_script),
+                    "seal",
+                    "--env-file",
+                    str(env_path),
+                    "--dry-run",
+                    "--json",
+                ],
                 capture_output=True,
                 text=True,
                 env=child_env,
@@ -680,7 +845,7 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
             # 3. seal without DPAPI on non-Windows fails closed and preserves bytes
             if sys.platform != "win32":
                 proc_seal = subprocess.run(
-                    [sys.executable, "-B", str(cli_script), "seal", "--env-file", str(env_path)],
+                    [sys.executable, "-I", "-S", "-B", str(cli_script), "seal", "--env-file", str(env_path)],
                     capture_output=True,
                     text=True,
                     env=child_env,
@@ -695,7 +860,7 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
 
             # 4. unknown subcommand exits 2 without leaking absolute script path or traceback
             proc_bad = subprocess.run(
-                [sys.executable, "-B", str(cli_script), "unknown-cmd"],
+                [sys.executable, "-I", "-S", "-B", str(cli_script), "unknown-cmd"],
                 capture_output=True,
                 text=True,
                 env=child_env,
@@ -703,9 +868,70 @@ class TestSharpeyeDpapiVaultCli(unittest.TestCase):
                 timeout=15,
             )
             self.assertEqual(proc_bad.returncode, 2)
+            self.assertEqual(proc_bad.stdout, "")
             self.assertNotIn(str(repo_root), proc_bad.stderr)
             self.assertNotIn(user_home, proc_bad.stderr)
             self.assertNotIn("Traceback", proc_bad.stderr)
+
+            # 5. status unrecognized args sanitize POSIX/Windows paths, API key, and DPAPI token
+            proc_status_bad = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(cli_script),
+                    "status",
+                    "--bogus",
+                    "/home/testuser/private/.env",
+                    r"C:\Users\TestUser\private\.env",
+                    "sk-leaktoken1234567890",
+                    "dpapi:v1:c2VjcmV0Y2lwaGVy",
+                ],
+                capture_output=True,
+                text=True,
+                env=child_env,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(proc_status_bad.returncode, 2)
+            self.assertEqual(proc_status_bad.stdout, "")
+            for forbidden in (
+                "/home/testuser",
+                r"C:\Users\TestUser",
+                "sk-leaktoken1234567890",
+                "c2VjcmV0Y2lwaGVy",
+                str(repo_root),
+                user_home,
+                "Traceback",
+            ):
+                self.assertNotIn(forbidden, proc_status_bad.stderr)
+            for placeholder in ("[PATH]", "[REDACTED_KEY]", "dpapi:v1:[REDACTED]"):
+                self.assertIn(placeholder, proc_status_bad.stderr)
+
+            # 6. seal invalid --scope sanitizes API key via subparser _SafeArgumentParser
+            proc_scope_bad = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    str(cli_script),
+                    "seal",
+                    "--scope",
+                    "AIzaSyLeakSecret1234567890",
+                ],
+                capture_output=True,
+                text=True,
+                env=child_env,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(proc_scope_bad.returncode, 2)
+            self.assertEqual(proc_scope_bad.stdout, "")
+            for forbidden in ("AIzaSyLeakSecret1234567890", str(repo_root), user_home, "Traceback"):
+                self.assertNotIn(forbidden, proc_scope_bad.stderr)
+            self.assertIn("[REDACTED_KEY]", proc_scope_bad.stderr)
 
 
 if __name__ == "__main__":

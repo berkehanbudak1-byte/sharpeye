@@ -21,7 +21,7 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
@@ -58,6 +58,8 @@ _SENSITIVE_KEY_RE = re.compile(
 )
 _ASSIGN_RE = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
 _INLINE_COMMENT_RE = re.compile(r"(\s+#.*)$")
+_WIN_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"`,;()]+")
+_POSIX_PATH_RE = re.compile(r"(?:(?<=^)|(?<=[\s'\"=(]))/(?:[^\s'\"`,;()]+)(?:/[^\s'\"`,;()]*)*")
 
 
 class VaultCLIError(RuntimeError):
@@ -81,6 +83,30 @@ def _safe_env_display_name(env_file: str | Path) -> str:
     if candidate in (".", "..") or ":" in candidate or any(ord(ch) < 32 for ch in candidate):
         return ".env"
     return candidate
+
+
+def _redact_sensitive_text(text: str) -> str:
+    """Redact API keys, Bearer tokens, DPAPI tokens, and URL credentials from errors."""
+    s = str(text or "")
+    s = re.sub(r"(https?://)([^/\s:@]+:[^/\s@]+@)", r"\1***@", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"([?&](?:api_key|apikey|token|access_token|secret|password|key)=)[^&\s]+",
+        r"\1***",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}", r"\1[REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bdpapi:v1:[A-Za-z0-9+/=]+", "dpapi:v1:[REDACTED]", s)
+    s = re.sub(r"\b(?:sk|xai|gsk|AIza)[-_A-Za-z0-9]{8,}\b", "[REDACTED_KEY]", s)
+    return s
+
+
+def _sanitize_output_text(text: str) -> str:
+    """Redact secrets and local filesystem paths from diagnostic messages."""
+    cleaned = _redact_sensitive_text(str(text or ""))
+    cleaned = _WIN_PATH_RE.sub("[PATH]", cleaned)
+    cleaned = _POSIX_PATH_RE.sub("[PATH]", cleaned)
+    return cleaned
 
 
 def _validate_key_names(keys: Iterable[str]) -> tuple[str, ...]:
@@ -539,8 +565,17 @@ def _format_seal_text(result: dict[str, Any]) -> str:
     )
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that sanitizes error output to prevent path or secret leakage."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        safe_msg = _sanitize_output_text(message)
+        self.exit(2, f"{self.prog}: error: {safe_msg}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="dpapi_vault_cli.py",
         description="Inspect or seal sharpeye secrets with Windows DPAPI.",
     )
@@ -594,7 +629,11 @@ def main(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        code = exc.code
+        return int(code) if isinstance(code, int) else 1
 
     try:
         if args.cmd == "status":
@@ -632,7 +671,7 @@ def main(
         print("Error: target .env path must be a regular file.", file=sys.stderr)
         return 1
     except VaultCLIError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {_sanitize_output_text(str(exc))}", file=sys.stderr)
         return 1
     except OSError as exc:
         print(f"Error: failed to access .env file ({type(exc).__name__}).", file=sys.stderr)
