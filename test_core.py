@@ -65,9 +65,23 @@ def fp_parse(c):
     return types.SimpleNamespace(entries=es)
 
 
+try:
+    import httpx as _real_httpx
+    _HTTPX_TIMEOUT_EXC = _real_httpx.TimeoutException
+    _HTTPX_TRANSPORT_EXC = _real_httpx.TransportError
+except ImportError:
+    class _HTTPX_TIMEOUT_EXC(Exception):
+        pass
+
+    class _HTTPX_TRANSPORT_EXC(Exception):
+        pass
+
+
 _ORIG_MODULES = {}
 _STUB_OBJS = {}
-for _name, _attrs in {"httpx": {"AsyncClient": Client, "Timeout": lambda *a, **k: None},
+for _name, _attrs in {"httpx": {"AsyncClient": Client, "Timeout": lambda *a, **k: None,
+                                "TimeoutException": _HTTPX_TIMEOUT_EXC,
+                                "TransportError": _HTTPX_TRANSPORT_EXC},
                       "feedparser": {"parse": fp_parse}}.items():
     _ORIG_MODULES[_name] = sys.modules.get(_name)
     _m = types.ModuleType(_name)
@@ -758,7 +772,180 @@ class SecurityAndGrokHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r_too_many.status_code, 422)
 
 
+class LLMFailoverResilienceTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        core._reset_provider_cooldowns()
+
+    def tearDown(self):
+        core._reset_provider_cooldowns()
+
+    async def test_default_gemini_model_and_missing_key_503(self):
+        expected_default = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        self.assertEqual(core.MODELS["gemini"], (expected_default, expected_default))
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "   "}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"):
+            with self.assertRaises(core.NewsError) as cm_direct:
+                await core._gemini("gemini-3.8-flash", "sys", "usr", 100)
+            self.assertEqual(cm_direct.exception.status, 503)
+
+            with self.assertRaises(core.NewsError) as cm_ask:
+                await REAL_ASK("main", "sys", "usr", 100)
+            self.assertEqual(cm_ask.exception.status, 503)
+
+    async def test_timeout_and_transport_retry(self):
+        class FakeHTTPErr(Exception):
+            def __init__(self, code):
+                super().__init__(f"HTTP {code}")
+                self.response = types.SimpleNamespace(status_code=code)
+
+        self.assertTrue(core._is_transient_err(core.httpx.TimeoutException("read timeout")))
+        self.assertTrue(core._is_transient_err(core.httpx.TransportError("connection reset")))
+        self.assertTrue(core._is_transient_err(FakeHTTPErr(429)))
+        self.assertTrue(core._is_transient_err(FakeHTTPErr(503)))
+        self.assertFalse(core._is_transient_err(FakeHTTPErr(400)))
+        self.assertFalse(core._is_transient_err(ValueError("bad json")))
+
+        attempts = {"timeout": 0, "transport": 0}
+
+        async def flaky_timeout(model, system, user, max_tokens):
+            attempts["timeout"] += 1
+            if attempts["timeout"] == 1:
+                raise core.httpx.TimeoutException("timed out once")
+            return '{"ok":"timeout-recovered"}'
+
+        async def flaky_transport(model, system, user, max_tokens):
+            attempts["transport"] += 1
+            if attempts["transport"] == 1:
+                raise core.httpx.TransportError("socket closed once")
+            return '{"ok":"transport-recovered"}'
+
+        with patch.object(core, "RETRY_DELAYS", (0, 0)):
+            out_t = await core._with_retry(flaky_timeout, "m", "s", "u", 100)
+            out_tr = await core._with_retry(flaky_transport, "m", "s", "u", 100)
+
+        self.assertEqual(out_t, '{"ok":"timeout-recovered"}')
+        self.assertEqual(attempts["timeout"], 2)
+        self.assertEqual(out_tr, '{"ok":"transport-recovered"}')
+        self.assertEqual(attempts["transport"], 2)
+
+    async def test_resolve_and_secondary_provider(self):
+        with patch.dict(os.environ, {"GROK_API_KEY": "g-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"):
+            self.assertEqual(core._resolve_provider(), "grok")
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "m-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "grok"):
+            self.assertEqual(core._resolve_provider(), "gemini")
+
+        with patch.dict(os.environ, {"GROK_API_KEY": "g-key", "GEMINI_API_KEY": "m-key"}, clear=True):
+            self.assertEqual(core._secondary_provider("grok"), "gemini")
+            self.assertEqual(core._secondary_provider("gemini"), "grok")
+
+        with patch.dict(os.environ, {"GROK_API_KEY": "g-key"}, clear=True):
+            self.assertIsNone(core._secondary_provider("grok"))
+
+        with patch.dict(os.environ, {"LLM_FALLBACK_PROVIDER": "ollama", "GROK_API_KEY": "g-key"}, clear=True):
+            self.assertEqual(core._secondary_provider("grok"), "ollama")
+
+        with patch.dict(os.environ, {"LLM_FALLBACK_PROVIDER": "none", "GROK_API_KEY": "g-key", "GEMINI_API_KEY": "m-key"}, clear=True):
+            self.assertIsNone(core._secondary_provider("grok"))
+
+    async def test_grok_to_gemini_failover_on_429_and_timeout(self):
+        class Fake429Error(Exception):
+            def __init__(self):
+                super().__init__("raw-429-secret-payload")
+                self.response = types.SimpleNamespace(status_code=429)
+
+        for err_factory, expected_err_name in (
+            (Fake429Error, "Fake429Error"),
+            (lambda: core.httpx.TimeoutException("raw-timeout-secret-payload"), core.httpx.TimeoutException.__name__),
+        ):
+            core._reset_provider_cooldowns()
+            calls = []
+
+            class GrokFailLLM:
+                async def post(self, url, headers=None, json=None):
+                    calls.append(url)
+                    if "chat/completions" in url:
+                        raise err_factory()
+                    return types.SimpleNamespace(
+                        raise_for_status=lambda: None,
+                        json=lambda: {"candidates": [{"content": {"parts": [{"text": '{"via":"gemini"}'}]}}]},
+                    )
+
+            with patch.dict(os.environ, {"GROK_API_KEY": "g-key", "GEMINI_API_KEY": "m-key"}, clear=True), \
+                 patch.object(core, "PROVIDER", "grok"), \
+                 patch.object(core, "RETRY_DELAYS", (0, 0)), \
+                 patch.object(core, "llm_http", GrokFailLLM()), \
+                 self.assertLogs(core.log, level="WARNING") as cm:
+                out = await REAL_ASK("main", "sys", "gizli-kullanici-sorgusu", 100)
+
+            self.assertEqual(out, '{"via":"gemini"}')
+            self.assertEqual(sum(1 for u in calls if "chat/completions" in u), 2)
+            self.assertEqual(sum(1 for u in calls if u.endswith(":generateContent")), 1)
+            log_text = "\n".join(cm.output)
+            self.assertIn("grok", log_text)
+            self.assertIn("gemini", log_text)
+            self.assertIn(expected_err_name, log_text)
+            self.assertNotIn("raw-429-secret-payload", log_text)
+            self.assertNotIn("raw-timeout-secret-payload", log_text)
+            self.assertNotIn("gizli-kullanici-sorgusu", log_text)
+
+    async def test_gemini_to_grok_failover_on_503_and_non_failover_raises(self):
+        class Fake503Error(Exception):
+            def __init__(self):
+                super().__init__("raw-503-secret-payload")
+                self.response = types.SimpleNamespace(status_code=503)
+
+        calls = []
+
+        class GeminiFailLLM:
+            async def post(self, url, headers=None, json=None):
+                calls.append(url)
+                if url.endswith(":generateContent"):
+                    raise Fake503Error()
+                return types.SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"choices": [{"message": {"content": '{"via":"grok"}'}}]},
+                )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "m-key", "GROK_API_KEY": "g-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"), \
+             patch.object(core, "RETRY_DELAYS", (0, 0)), \
+             patch.object(core, "llm_http", GeminiFailLLM()), \
+             self.assertLogs(core.log, level="WARNING") as cm:
+            out = await REAL_ASK("main", "sys", "gizli-sorgu-503", 100)
+
+        self.assertEqual(out, '{"via":"grok"}')
+        self.assertEqual(sum(1 for u in calls if u.endswith(":generateContent")), 2)
+        self.assertEqual(sum(1 for u in calls if "chat/completions" in u), 1)
+        log_text = "\n".join(cm.output)
+        self.assertIn("gemini", log_text)
+        self.assertIn("grok", log_text)
+        self.assertIn("Fake503Error", log_text)
+        self.assertNotIn("raw-503-secret-payload", log_text)
+        self.assertNotIn("gizli-sorgu-503", log_text)
+
+        # Non-failover error (e.g. ValueError) must not trigger secondary provider
+        non_fb_calls = []
+
+        class ValueErrLLM:
+            async def post(self, url, headers=None, json=None):
+                non_fb_calls.append(url)
+                raise ValueError("unexpected parse issue")
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "m-key", "GROK_API_KEY": "g-key"}, clear=True), \
+             patch.object(core, "PROVIDER", "gemini"), \
+             patch.object(core, "RETRY_DELAYS", (0, 0)), \
+             patch.object(core, "llm_http", ValueErrLLM()):
+            with self.assertRaises(ValueError):
+                await REAL_ASK("main", "sys", "usr", 100)
+        self.assertEqual(len(non_fb_calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
 
 
