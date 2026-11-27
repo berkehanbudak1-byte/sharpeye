@@ -273,7 +273,7 @@ function renderAnalysis(a){
   if(a.timeline?.length)r.append(eventTimeline(a.timeline));
   const imgs=Object.entries(a.images||{}).filter(([n,u])=>ITEMS[n-1]&&/^https:\/\//.test(u)).slice(0,8);
   if(imgs.length){const s=block("Haberlerden görseller"),gl=el("div","gal");
-    imgs.forEach(([n,u])=>{const it=ITEMS[n-1],card=el("a");card.href=it.link;card.target="_blank";card.rel="noopener noreferrer";
+    imgs.forEach(([n,u])=>{const it=ITEMS[n-1],card=el("a");card.href=/^https?:\/\//.test(it.link)?it.link:"#";card.target="_blank";card.rel="noopener noreferrer";
       const im=el("img");im.src=u;im.alt="";im.loading="lazy";im.referrerPolicy="no-referrer";im.onerror=()=>card.remove();
       card.append(im,el("p",null,it.source+": "+it.title));gl.append(card)});
     s.append(gl);r.append(s)}

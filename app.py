@@ -1,6 +1,10 @@
 """Çalıştır: uvicorn app:app   (önbellek ve istek sınırı süreç içi olduğundan tek worker kullan)"""
+import base64
+import hashlib
 import os
+import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
@@ -11,10 +15,39 @@ import core
 
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
+_INDEX_PATH = Path(__file__).parent / "index.html"
+
+
+def _script_hashes(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    return [
+        "'sha256-" + base64.b64encode(hashlib.sha256(m.encode("utf-8")).digest()).decode() + "'"
+        for m in re.findall(r"<script>(.*?)</script>", text, re.S)
+    ]
+
+
+_CSP = "; ".join([
+    "default-src 'self'",
+    "script-src " + " ".join(["'self'", *_script_hashes(_INDEX_PATH)]),
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
+
 SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    "Content-Security-Policy": _CSP,
 }
 
 
@@ -56,7 +89,7 @@ class AlertsRequest(BaseModel):
     keywords: str = Field(default="", max_length=200)
     signal: str = Field(default="", max_length=20)
     rules: list[AlertRule | str] = Field(default_factory=list, max_length=50)
-    items: list[dict] | None = None
+    items: list[dict] | None = Field(default=None, max_length=200)
 
 
 def client_ip(request: Request):
@@ -70,7 +103,25 @@ def win(body: Query):
     return body.window if body.window in core.WINDOWS else core.DEFAULT_WINDOW
 
 
+def verify_origin(request: Request):
+    """Tarayıcı kaynaklı POST/PUT/PATCH/DELETE isteklerinde Origin başlığını doğrular."""
+    if getattr(request, "method", "GET").upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return
+    p = urlsplit(origin)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        raise HTTPException(403, "Geçersiz istek kaynağı (Origin).")
+    host = (request.headers.get("host") or "").strip().lower()
+    allowed_env = {o.strip().lower().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()}
+    origin_norm = f"{p.scheme.lower()}://{p.netloc.lower()}"
+    if p.netloc.lower() != host and origin_norm not in allowed_env:
+        raise HTTPException(403, "Geçersiz istek kaynağı (Origin).")
+
+
 def guard(request: Request):
+    verify_origin(request)
     if not limiter.allow(client_ip(request)):
         raise HTTPException(429, "Çok fazla istek. Bir dakika sonra tekrar dene.")
 
@@ -94,10 +145,13 @@ async def news(body: Query, request: Request):
 @app.post("/api/export")  # anlık CSV / JSON istihbarat raporu dışa aktarımı
 async def export_news(body: ExportRequest, request: Request):
     guard(request)
+    fmt = body.format.strip().lower()
+    if fmt not in ("csv", "json"):
+        raise HTTPException(422, "Geçersiz dışa aktarma biçimi (csv veya json olmalı).")
     items = await run(core.get_news(body.query, win(body)))
     if body.keywords or body.signal:
         items = core.filter_items(items, body.keywords, body.signal)
-    if body.format.lower() == "json":
+    if fmt == "json":
         return Response(content=core.export_items_json(items), media_type="application/json; charset=utf-8")
     return Response(content=core.export_items_csv(items), media_type="text/csv; charset=utf-8")
 
