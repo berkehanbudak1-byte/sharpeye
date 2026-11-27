@@ -11,7 +11,7 @@ log = logging.getLogger("haber")
 # Sağlayıcı: gemini (ücretsiz kota) | grok / xai (xAI) | ollama (yerel) | anthropic (ücretli)
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-_g, _o = os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+_g, _o = os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 _k = os.getenv("XAI_MODEL") or os.getenv("GROK_MODEL") or "grok-3-mini"
 MODELS = {"gemini": (_g, _g), "ollama": (_o, _o), "grok": (_k, _k),  # (ana model, çeviri modeli)
           "anthropic": (os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
@@ -366,6 +366,7 @@ RETRY_DELAYS = (0, 3, 8)
 TRANSIENT = {429, 500, 502, 503, 504}
 QUOTA_CODES = {402, 429}
 QUOTA_OR_TRANSIENT = TRANSIENT | QUOTA_CODES
+FAILOVER_STATUSES = {401, 402, 403, 404, 429, 500, 502, 503, 504}
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
 FALLBACK_PROVIDER = (os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
 LLM_COOLDOWN_SECS = int(os.getenv("LLM_COOLDOWN_SECS", "300"))
@@ -385,24 +386,60 @@ def _in_cooldown(prov):
     return False
 
 
-def _resolve_fallback_provider(prov):
-    fb_prov = (FALLBACK_PROVIDER or os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
+def _is_transient_err(e):
+    if getattr(getattr(e, "response", None), "status_code", None) in TRANSIENT:
+        return True
+    net_err = tuple(
+        t for t in (getattr(httpx, "TimeoutException", None), getattr(httpx, "TransportError", None))
+        if isinstance(t, type) and issubclass(t, BaseException)
+    )
+    return bool(net_err) and isinstance(e, net_err)
+
+
+def _resolve_provider():
+    prov = (PROVIDER if PROVIDER != "gemini" else os.getenv("LLM_PROVIDER", PROVIDER)).strip().lower()
+    if prov == "xai":
+        prov = "grok"
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    has_grok = bool(_grok_api_key())
+    if prov == "gemini" and not has_gemini and has_grok:
+        return "grok"
+    if prov == "grok" and not has_grok and has_gemini:
+        return "gemini"
+    if prov not in MODELS:
+        return "grok" if has_grok else "gemini"
+    return prov
+
+
+def _secondary_provider(primary):
+    fb_prov = (
+        os.environ.get("LLM_FALLBACK_PROVIDER")
+        or os.environ.get("FALLBACK_PROVIDER")
+        or FALLBACK_PROVIDER
+        or ""
+    ).strip().lower()
+    if fb_prov in ("none", "off", "false", "0"):
+        return None
     if fb_prov == "xai":
         fb_prov = "grok"
     if not fb_prov:
-        if prov == "grok" and os.environ.get("GEMINI_API_KEY", "").strip():
+        if primary == "grok" and os.environ.get("GEMINI_API_KEY", "").strip():
             fb_prov = "gemini"
-        elif prov == "gemini" and _grok_api_key():
+        elif primary == "gemini" and _grok_api_key():
             fb_prov = "grok"
-    if not fb_prov or fb_prov == prov or fb_prov not in MODELS:
-        return ""
+    if not fb_prov or fb_prov == primary or fb_prov not in MODELS:
+        return None
     if fb_prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
-        return ""
+        return None
     if fb_prov == "grok" and not _grok_api_key():
-        return ""
+        return None
     if _in_cooldown(fb_prov):
-        return ""
+        return None
     return fb_prov
+
+
+def _resolve_fallback_provider(prov):
+    return _secondary_provider(prov) or ""
 
 
 def _provider_call(prov, kind):
@@ -422,29 +459,23 @@ async def _with_retry(call, model, system, user, max_tokens):
         try:
             return await call(model, system, user, max_tokens)
         except Exception as e:
-            if getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+            if not _is_transient_err(e):
                 raise
             last = e
     raise last
 
 
 async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
-    prov = (PROVIDER if PROVIDER != "gemini" else os.getenv("LLM_PROVIDER", PROVIDER)).strip().lower()
-    if prov == "xai":
-        prov = "grok"
-    if prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip() and _grok_api_key():
-        prov = "grok"
-    elif prov not in MODELS:
-        prov = "grok" if _grok_api_key() else "gemini"
-    fb_prov = _resolve_fallback_provider(prov)
-    if _in_cooldown(prov) and fb_prov:
-        prov, fb_prov = fb_prov, ""
+    prov = _resolve_provider()
+    secondary = _secondary_provider(prov)
+    if _in_cooldown(prov) and secondary:
+        prov, secondary = secondary, None
     call, model = _provider_call(prov, kind)
     try:
         try:
             return await _with_retry(call, model, system, user, max_tokens)
         except Exception as e:
-            if not FALLBACK_MODEL or getattr(getattr(e, "response", None), "status_code", None) not in TRANSIENT:
+            if not FALLBACK_MODEL or not _is_transient_err(e):
                 raise
             return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
     except Exception as e:
@@ -453,14 +484,17 @@ async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
             cooldown_secs = int(os.getenv("LLM_COOLDOWN_SECS", str(LLM_COOLDOWN_SECS)) or LLM_COOLDOWN_SECS)
             if cooldown_secs > 0:
                 _PROVIDER_COOLDOWN_UNTIL[prov] = time.monotonic() + cooldown_secs
-        if status not in QUOTA_OR_TRANSIENT:
+        if not (_is_transient_err(e) or isinstance(e, NewsError) or status in FAILOVER_STATUSES):
             raise
-        if not fb_prov:
-            fb_prov = _resolve_fallback_provider(prov)
-        if not fb_prov:
+        if not secondary:
+            secondary = _secondary_provider(prov)
+        if not secondary:
             raise
-        log.warning("Grok hatası (%s %s), yedek sağlayıcıya geçiliyor: %s", type(e).__name__, status, fb_prov)
-        fb_call, fb_model = _provider_call(fb_prov, kind)
+        if isinstance(status, int):
+            log.warning("LLM sağlayıcı hatası (%s -> %s): %s %s", prov, secondary, type(e).__name__, status)
+        else:
+            log.warning("LLM sağlayıcı hatası (%s -> %s): %s", prov, secondary, type(e).__name__)
+        fb_call, fb_model = _provider_call(secondary, kind)
         return await _with_retry(fb_call, fb_model, system, user, max_tokens)
 
 
