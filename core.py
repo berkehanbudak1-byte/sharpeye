@@ -364,9 +364,45 @@ async def _anthropic(model, system, user, max_tokens):
 
 RETRY_DELAYS = (0, 3, 8)
 TRANSIENT = {429, 500, 502, 503, 504}
-QUOTA_OR_TRANSIENT = TRANSIENT | {402}
+QUOTA_CODES = {402, 429}
+QUOTA_OR_TRANSIENT = TRANSIENT | QUOTA_CODES
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
 FALLBACK_PROVIDER = (os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
+LLM_COOLDOWN_SECS = int(os.getenv("LLM_COOLDOWN_SECS", "300"))
+_PROVIDER_COOLDOWN_UNTIL = {}
+
+
+def _reset_provider_cooldowns():
+    _PROVIDER_COOLDOWN_UNTIL.clear()
+
+
+def _in_cooldown(prov):
+    until = _PROVIDER_COOLDOWN_UNTIL.get(prov, 0.0)
+    if until and time.monotonic() < until:
+        return True
+    if until:
+        _PROVIDER_COOLDOWN_UNTIL.pop(prov, None)
+    return False
+
+
+def _resolve_fallback_provider(prov):
+    fb_prov = (FALLBACK_PROVIDER or os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
+    if fb_prov == "xai":
+        fb_prov = "grok"
+    if not fb_prov:
+        if prov == "grok" and os.environ.get("GEMINI_API_KEY", "").strip():
+            fb_prov = "gemini"
+        elif prov == "gemini" and _grok_api_key():
+            fb_prov = "grok"
+    if not fb_prov or fb_prov == prov or fb_prov not in MODELS:
+        return ""
+    if fb_prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
+        return ""
+    if fb_prov == "grok" and not _grok_api_key():
+        return ""
+    if _in_cooldown(fb_prov):
+        return ""
+    return fb_prov
 
 
 def _provider_call(prov, kind):
@@ -400,6 +436,9 @@ async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
         prov = "grok"
     elif prov not in MODELS:
         prov = "grok" if _grok_api_key() else "gemini"
+    fb_prov = _resolve_fallback_provider(prov)
+    if _in_cooldown(prov) and fb_prov:
+        prov, fb_prov = fb_prov, ""
     call, model = _provider_call(prov, kind)
     try:
         try:
@@ -410,16 +449,15 @@ async def ask(kind, system, user, max_tokens):  # kind: "main" | "fast"
             return await _with_retry(call, FALLBACK_MODEL, system, user, max_tokens)
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
-        if prov != "grok" or status not in QUOTA_OR_TRANSIENT:
+        if status in QUOTA_CODES:
+            cooldown_secs = int(os.getenv("LLM_COOLDOWN_SECS", str(LLM_COOLDOWN_SECS)) or LLM_COOLDOWN_SECS)
+            if cooldown_secs > 0:
+                _PROVIDER_COOLDOWN_UNTIL[prov] = time.monotonic() + cooldown_secs
+        if status not in QUOTA_OR_TRANSIENT:
             raise
-        fb_prov = (FALLBACK_PROVIDER or os.getenv("FALLBACK_PROVIDER") or os.getenv("LLM_FALLBACK_PROVIDER") or "").strip().lower()
-        if fb_prov == "xai":
-            fb_prov = "grok"
-        if not fb_prov and os.environ.get("GEMINI_API_KEY", "").strip():
-            fb_prov = "gemini"
-        if not fb_prov or fb_prov == prov or fb_prov not in MODELS:
-            raise
-        if fb_prov == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
+        if not fb_prov:
+            fb_prov = _resolve_fallback_provider(prov)
+        if not fb_prov:
             raise
         log.warning("Grok hatası (%s %s), yedek sağlayıcıya geçiliyor: %s", type(e).__name__, status, fb_prov)
         fb_call, fb_model = _provider_call(fb_prov, kind)
@@ -1145,7 +1183,7 @@ async def _analyze(query, window=DEFAULT_WINDOW):
     except NewsError:
         raise
     except Exception as e:
-        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+        if getattr(getattr(e, "response", None), "status_code", None) in QUOTA_CODES:
             raise NewsError("Ücretsiz yapay zekâ kotası doldu. Biraz sonra tekrar dene.", 429)
         log.warning("analiz hatası: %s", type(e).__name__)
         raise NewsError("Analiz üretilemedi. Biraz sonra tekrar dene.", 502)
